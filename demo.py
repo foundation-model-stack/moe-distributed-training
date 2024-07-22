@@ -6,11 +6,11 @@ from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import torch
 
 
-# Demo for running databricks megablocks on mixtral 
-
+# Demo for running databricks megablocks on mixtral using accelerate + FSDP1
+# - this uses HF Trainer's integration of FSDP1
+MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
 def main(
-    model_name: str = "mistralai/Mixtral-8x7B-Instruct-v0.1",
     max_seq_length=4096,
     load_model_dtype='bfloat16', # FSDP shared params will take 
     attn_implementation='sdpa',
@@ -22,14 +22,14 @@ def main(
     training_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        MODEL_NAME,
         torch_dtype=getattr(torch, load_model_dtype), ## UPDATED
         attn_implementation=attn_implementation, ## UPDATED
     )
 
     # we set the max sequence length here
     tokenizer = AutoTokenizer.from_pretrained(
-        model_name, model_max_length=max_seq_length,
+        MODEL_NAME, model_max_length=max_seq_length,
     )
 
     if tokenizer.pad_token is None:
