@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.distributed._tensor.device_mesh import init_device_mesh
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
@@ -18,7 +19,7 @@ from torch.utils.checkpoint import checkpoint
 
 from tqdm import tqdm
 from torch.optim import AdamW
-
+from megablocks_utils.utils import shard_moe, get_moe_kwargs
 
 # Demo for running databricks megablocks on mixtral using FSDP2
 # - for this we only use accelerate, we cannot use HF Trainer
@@ -27,12 +28,15 @@ from torch.optim import AdamW
 #   we need to use the torchrun launcher
 MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
+# https://github.com/pytorch/pytorch/issues/114299
+
 def main(
     max_seq_length: str =4096,
     load_model_dtype: str='bfloat16', # FSDP shared params will take 
     attn_implementation: str ='sdpa',
     per_device_train_batch_size: int = 1,
     gradient_accumulation_steps: int = 1,
+    use_megablocks_sharding: bool = False,
 ):
 
     # parser = HfArgumentParser(
@@ -46,6 +50,9 @@ def main(
         attn_implementation=attn_implementation, 
         low_cpu_mem_usage=True, # set this manually to also support torchrun
     )
+
+    # HACK
+    # model.model.layers = model.model.layers[:2]
 
     # we set the max sequence length here
     tokenizer = AutoTokenizer.from_pretrained(
@@ -79,19 +86,45 @@ def main(
         collate_fn=data_collator
     )
 
+    # some stuff that we need to get before
+    # torch.dist is initialialzed
+    world_size = int(os.environ.get('WORLD_SIZE', 1))
+    rank = int(os.environ.get('RANK', 0))
+
+    if use_megablocks_sharding:
+
+        dp_mesh = shard_moe(
+            model, 
+            MixtralSparseMoeBlock, 
+            checkpoint_name_or_path=MODEL_NAME,
+            rank=rank,
+            world_size=world_size,
+            ep_size=world_size,
+            moe_kwargs=get_moe_kwargs(
+                model.config, 
+                has_bias=False,
+                fp16=(load_model_dtype == 'float16'),
+                bf16=(load_model_dtype == 'bfloat16'),
+            ),
+        )
+        from torch.distributed._composable.contract import REGISTRY_KEY
+        for layer in model.model.layers:
+            setattr(
+                layer.block_sparse_moe, REGISTRY_KEY, {'replicate'}
+            )
+    else:
+        dp_mesh = init_device_mesh(
+            "cuda", 
+            (world_size,), mesh_dim_names=('dp', )
+        )['dp']
+
     mp_policy = MixedPrecisionPolicy(
         param_dtype=getattr(torch, load_model_dtype), 
         reduce_dtype=getattr(torch, load_model_dtype), 
     )
 
-    print (os.environ)
+    fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
 
-    mesh = init_device_mesh(
-        "cuda", 
-        (int(os.environ.get('WORLD_SIZE', 1)),), mesh_dim_names=('dp', )
-    )
-
-    fsdp_config = {"mesh": mesh['dp'], "mp_policy": mp_policy}
 
     # apply sharding on the model
     # - this is a drop-in replacement for accelerate.prepare_model
@@ -106,12 +139,23 @@ def main(
             reshard_after_forward = layer_id < (n_layers - 1)
 
             # activation checkpoint (by default)
+            if use_megablocks_sharding:
+                # somehow need this for MoE
+                _checkpoint_args = {
+                    'checkpoint_impl': CheckpointImpl.REENTRANT,
+                    'use_reentrant': True,
+                }
+            else:
+                _checkpoint_args = {
+                    'checkpoint_impl': CheckpointImpl.NO_REENTRANT,
+                    'use_reentrant': False,
+                }
+
             transformer_block = ptd_checkpoint_wrapper(
                 transformer_block,
-                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
                 checkpoint_fn=checkpoint,
-                use_reentrant=False,
                 preserve_rng_state=False,
+                **_checkpoint_args
             )
 
             # perform the sharding
