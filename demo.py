@@ -4,7 +4,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 from transformers import TrainingArguments
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import torch
-
+from megablocks_utils.utils import shard_moe, get_moe_kwargs
+from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 
 # Demo for running databricks megablocks on mixtral using accelerate + FSDP1
 # - this uses HF Trainer's integration of FSDP1
@@ -14,6 +15,7 @@ def main(
     max_seq_length=4096,
     load_model_dtype='bfloat16', # FSDP shared params will take 
     attn_implementation='sdpa',
+    use_megablocks_sharding: bool = False,
 ):
 
     parser = HfArgumentParser(
@@ -63,6 +65,27 @@ def main(
         max_seq_length=max_seq_length,
         data_collator=data_collator,
     )
+
+    if use_megablocks_sharding:
+
+        dp_mesh = shard_moe(
+            model, 
+            MixtralSparseMoeBlock, 
+            checkpoint_name_or_path=MODEL_NAME,
+            rank=torch.distributed.get_rank(),
+            world_size=torch.distributed.get_world_size(),
+            ep_size=torch.distributed.get_world_size(),
+            moe_kwargs=get_moe_kwargs(
+                model.config, 
+                has_bias=False,
+                fp16=training_args.fp16,
+                bf16=training_args.bf16,
+            ),
+        )
+
+        trainer.accelerator.state.fsdp_plugin.ignored_modules = [
+            layer.block_sparse_moe for layer in model.model.layers
+        ]
 
     trainer.train()
 
