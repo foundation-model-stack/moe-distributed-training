@@ -2,6 +2,7 @@
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 from transformers import TrainingArguments
+from transformers.optimization import get_scheduler
 from trl import  DataCollatorForCompletionOnlyLM
 from accelerate import Accelerator
 import os
@@ -17,9 +18,10 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.utils.checkpoint import checkpoint
 
-from tqdm import tqdm
+from tqdm import tqdm, trange
 from torch.optim import AdamW
-from megablocks_utils.utils import shard_moe, get_moe_kwargs
+from megablocks_utils.shard_moe_utils import shard_moe, get_moe_kwargs
+from megablocks_utils.config_utils import update_mlp_registry
 
 # Demo for running databricks megablocks on mixtral using FSDP2
 # - for this we only use accelerate, we cannot use HF Trainer
@@ -28,7 +30,17 @@ from megablocks_utils.utils import shard_moe, get_moe_kwargs
 #   we need to use the torchrun launcher
 MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
+# call this to patch the megablocks 
+update_mlp_registry()
+
 # https://github.com/pytorch/pytorch/issues/114299
+# - issue on agwu on how FSDP2 should be per-parameter sharding
+
+# https://github.com/huggingface/accelerate/issues/2873
+# - HF issue asking when we should integrate FSDP2, with questions on stability
+
+# https://pytorch.org/blog/training-moes/
+# - blog on databricks + pytorch collab on MoE train
 
 def main(
     max_seq_length: str =4096,
@@ -37,6 +49,11 @@ def main(
     per_device_train_batch_size: int = 1,
     gradient_accumulation_steps: int = 1,
     use_megablocks_sharding: bool = False,
+    lr_scheduler_type: str = 'linear',
+    num_epochs: int = 1,
+    num_warmup_steps: int = 0,
+    # max_grad_norm: float = 1.0,
+    learning_rate: float = 1e-5,
 ):
 
     # parser = HfArgumentParser(
@@ -178,32 +195,87 @@ def main(
 
     # create the accelerator, optimizer and prepare for distributed
     # training
+    from accelerate.utils import GradientAccumulationPlugin
+
     accelerator = Accelerator(
-        gradient_accumulation_steps=gradient_accumulation_steps
+        # gradient_accumulation_steps=gradient_accumulation_steps
+        gradient_accumulation_plugin=GradientAccumulationPlugin(
+            num_steps=gradient_accumulation_steps,
+            sync_each_batch=True, # to 
+        )
     )
 
     # - create optimizer
-    optimizer = AdamW(model.parameters(), lr=1e-5)
+    optimizer = AdamW(model.parameters(), lr=learning_rate)
+
+    # - create scheduler
+    scheduler = get_scheduler(
+        lr_scheduler_type,
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_epochs * len(dataloader)
+    )
 
     # - prepare for distributed training
-    dataloader, optimizer = accelerator.prepare(dataloader, optimizer)
+    dataloader, optimizer, scheduler = accelerator.prepare(
+        dataloader, optimizer, scheduler
+    )
 
     # train loop
-    for batch in tqdm(dataloader, disable=torch.distributed.get_rank()> 0):
-      optimizer.zero_grad()
-      inputs, targets = batch['input_ids'], batch['labels']
-      inputs = inputs.to('cuda')
-      targets = targets.to('cuda')
-      outputs = model(inputs, labels=targets, use_cache=False)
-      loss = outputs.loss
-      accelerator.backward(loss)
-      optimizer.step()
+    len_dataloader = len(dataloader)
+    num_update_steps_per_epoch = len_dataloader // gradient_accumulation_steps
+    total_train_steps = num_update_steps_per_epoch * num_epochs
+    step = -1
+    tr_loss = 0.
+    with trange(
+        total_train_steps,
+        disable=torch.distributed.get_rank() > 0
+    ) as pbar:
+        for epoch in range(num_epochs):
 
-      print ({'loss': loss.item()})
-      # scheduler.step()
+            if hasattr(dataloader, "set_epoch"):
+                dataloader.set_epoch(epoch)
 
+            for batch in dataloader:
+
+                step += 1
+
+                inputs, targets = batch['input_ids'], batch['labels']
+                inputs = inputs.to('cuda')
+                targets = targets.to('cuda')
+
+                with accelerator.accumulate(model):
+                    outputs = model(inputs, labels=targets, use_cache=False)
+                    loss = outputs.loss
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                tr_loss += loss.item() / gradient_accumulation_steps
+
+                # needs to be fixed, this doesnt work with FSDP2
+                # if accelerator.sync_gradients:
+                #     accelerator.clip_grad_value_(model.parameters(), max_grad_norm)
+
+                if (
+                    step > 0 and
+                    step % gradient_accumulation_steps == 0
+                ):
+                    last_lr = scheduler.get_last_lr()[0]
+                    print ({
+                        'epoch': round(
+                            step / num_update_steps_per_epoch /
+                            gradient_accumulation_steps, 4
+                        ),
+                        'loss': tr_loss,
+                        'learning_rate': last_lr,
+                    }, flush=True)
+
+                    tr_loss = 0.
+
+                    pbar.update(1)
 
 if __name__ == '__main__':
     import fire
     fire.Fire(main)
-    main()

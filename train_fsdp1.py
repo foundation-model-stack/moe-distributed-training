@@ -4,12 +4,15 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 from transformers import TrainingArguments
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import torch
-from megablocks_utils.utils import shard_moe, get_moe_kwargs
+from megablocks_utils.shard_moe_utils import shard_moe, get_moe_kwargs
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
+from megablocks_utils.config_utils import update_mlp_registry
 
 # Demo for running databricks megablocks on mixtral using accelerate + FSDP1
 # - this uses HF Trainer's integration of FSDP1
 MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+
+update_mlp_registry()
 
 def main(
     max_seq_length=4096,
@@ -28,6 +31,9 @@ def main(
         torch_dtype=getattr(torch, load_model_dtype), ## UPDATED
         attn_implementation=attn_implementation, ## UPDATED
     )
+
+    # HACK
+    # model.model.layers = model.model.layers[:2]
 
     # we set the max sequence length here
     tokenizer = AutoTokenizer.from_pretrained(
@@ -92,4 +98,3 @@ def main(
 if __name__ == '__main__':
     import fire
     fire.Fire(main)
-    main()
