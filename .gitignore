@@ -1,2 +1,4 @@
 results
 *.pyc
+*.log
+*.err

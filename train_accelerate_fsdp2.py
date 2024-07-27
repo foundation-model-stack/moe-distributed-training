@@ -7,6 +7,7 @@ from trl import  DataCollatorForCompletionOnlyLM
 from accelerate import Accelerator
 import os
 import torch
+import json
 from torch.utils.data import DataLoader
 from torch.distributed._tensor.device_mesh import init_device_mesh
 from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
@@ -18,7 +19,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.utils.checkpoint import checkpoint
 
-from tqdm import tqdm, trange
+from tqdm.auto import tqdm, trange
 from torch.optim import AdamW
 from megablocks_utils.shard_moe_utils import shard_moe, get_moe_kwargs
 from megablocks_utils.config_utils import update_mlp_registry
@@ -54,6 +55,7 @@ def main(
     num_warmup_steps: int = 0,
     # max_grad_norm: float = 1.0,
     learning_rate: float = 1e-5,
+    debug: bool = False,
 ):
 
     # parser = HfArgumentParser(
@@ -68,8 +70,9 @@ def main(
         low_cpu_mem_usage=True, # set this manually to also support torchrun
     )
 
-    # HACK
-    # model.model.layers = model.model.layers[:2]
+    if debug:
+        # will just change to two layers for a quick run
+        model.model.layers = model.model.layers[:2]
 
     # we set the max sequence length here
     tokenizer = AutoTokenizer.from_pretrained(
@@ -124,6 +127,11 @@ def main(
                 bf16=(load_model_dtype == 'bfloat16'),
             ),
         )
+
+        # NOTE: this is a hack to hve the FSDP fully_shard ignore the MoE 
+        # module, whilst sharding the attention module.
+        # - setting this composable contract "replicate", it will cause it
+        #   to be ignored.
         from torch.distributed._composable.contract import REGISTRY_KEY
         for layer in model.model.layers:
             setattr(
@@ -193,19 +201,7 @@ def main(
     # prepare the model without accelerate
     model = prepare_model(model)
 
-    # create the accelerator, optimizer and prepare for distributed
-    # training
-    from accelerate.utils import GradientAccumulationPlugin
-
-    accelerator = Accelerator(
-        # gradient_accumulation_steps=gradient_accumulation_steps
-        gradient_accumulation_plugin=GradientAccumulationPlugin(
-            num_steps=gradient_accumulation_steps,
-            sync_each_batch=True, # to 
-        )
-    )
-
-    # - create optimizer
+    # - create optimizer (after sharding)
     optimizer = AdamW(model.parameters(), lr=learning_rate)
 
     # - create scheduler
@@ -213,24 +209,40 @@ def main(
         lr_scheduler_type,
         optimizer=optimizer,
         num_warmup_steps=num_warmup_steps,
-        num_training_steps=num_epochs * len(dataloader)
+        num_training_steps=len(dataloader) // gradient_accumulation_steps * num_epochs,
     )
 
-    # - prepare for distributed training
+    # create the accelerator, optimizer and prepare for distributed
+    # training
+    from accelerate.utils import GradientAccumulationPlugin
+
+    accelerator = Accelerator(
+        gradient_accumulation_plugin=GradientAccumulationPlugin(
+            num_steps=gradient_accumulation_steps,
+            sync_each_batch=True, # to save memory
+        )
+    )
+
+    # - prepare for distributed training 
     dataloader, optimizer, scheduler = accelerator.prepare(
         dataloader, optimizer, scheduler
     )
 
-    # train loop
-    len_dataloader = len(dataloader)
-    num_update_steps_per_epoch = len_dataloader // gradient_accumulation_steps
+    # after prepare compute these (note the dataloader length will change here)
+    num_update_steps_per_epoch = len(dataloader) // gradient_accumulation_steps
     total_train_steps = num_update_steps_per_epoch * num_epochs
+
+    # train loop
     step = -1
     tr_loss = 0.
+    start_time = torch.cuda.Event(enable_timing=True)
+    end_time = torch.cuda.Event(enable_timing=True)
     with trange(
         total_train_steps,
         disable=torch.distributed.get_rank() > 0
     ) as pbar:
+
+        start_time.record()
         for epoch in range(num_epochs):
 
             if hasattr(dataloader, "set_epoch"):
@@ -245,36 +257,49 @@ def main(
                 targets = targets.to('cuda')
 
                 with accelerator.accumulate(model):
+                    optimizer.zero_grad()
                     outputs = model(inputs, labels=targets, use_cache=False)
                     loss = outputs.loss
                     accelerator.backward(loss)
                     optimizer.step()
                     scheduler.step()
-                    optimizer.zero_grad()
 
                 tr_loss += loss.item() / gradient_accumulation_steps
 
-                # needs to be fixed, this doesnt work with FSDP2
+                # having some problems with clipping now since we have a mixture
+                # of regular and DTensors at the moment
                 # if accelerator.sync_gradients:
-                #     accelerator.clip_grad_value_(model.parameters(), max_grad_norm)
+                #     # _grad_norm = accelerator.clip_grad_value_(model.parameters(), max_grad_norm)
 
                 if (
                     step > 0 and
                     step % gradient_accumulation_steps == 0
                 ):
                     last_lr = scheduler.get_last_lr()[0]
-                    print ({
+                    metrics = {
                         'epoch': round(
                             step / num_update_steps_per_epoch /
-                            gradient_accumulation_steps, 4
+                            gradient_accumulation_steps, 2
                         ),
                         'loss': tr_loss,
                         'learning_rate': last_lr,
-                    }, flush=True)
+                        # 'grad_norm': _grad_norm,
+                    }
 
+                    # reset
                     tr_loss = 0.
 
+                    # report
                     pbar.update(1)
+                    pbar.write(json.dumps(metrics))
+
+        end_time.record()
+        torch.cuda.synchronize()
+        elapsed_time_s = start_time.elapsed_time(end_time) / 1000  # secs
+        pbar.write(json.dumps({
+            'train_runtime': elapsed_time_s,
+            'train_steps_per_second': total_train_steps / elapsed_time_s
+        }))
 
 if __name__ == '__main__':
     import fire

@@ -19,6 +19,7 @@ def main(
     load_model_dtype='bfloat16', # FSDP shared params will take 
     attn_implementation='sdpa',
     use_megablocks_sharding: bool = False,
+    debug: bool = False,
 ):
 
     parser = HfArgumentParser(
@@ -32,8 +33,9 @@ def main(
         attn_implementation=attn_implementation, ## UPDATED
     )
 
-    # HACK
-    # model.model.layers = model.model.layers[:2]
+    if debug:
+        # will just change to two layers for a quick run
+        model.model.layers = model.model.layers[:2]
 
     # we set the max sequence length here
     tokenizer = AutoTokenizer.from_pretrained(
