@@ -1,7 +1,6 @@
 
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
-from transformers import TrainingArguments
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.optimization import get_scheduler
 from trl import  DataCollatorForCompletionOnlyLM
 from accelerate import Accelerator
@@ -55,13 +54,8 @@ def main(
     num_warmup_steps: int = 0,
     # max_grad_norm: float = 1.0,
     learning_rate: float = 1e-5,
-    debug: bool = False,
+    truncate_model_for_debug: bool = False,
 ):
-
-    # parser = HfArgumentParser(
-    #     dataclass_types=TrainingArguments
-    # )
-    # training_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
 
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
@@ -70,7 +64,7 @@ def main(
         low_cpu_mem_usage=True, # set this manually to also support torchrun
     )
 
-    if debug:
+    if truncate_model_for_debug:
         # will just change to two layers for a quick run
         model.model.layers = model.model.layers[:2]
 
@@ -232,6 +226,10 @@ def main(
     num_update_steps_per_epoch = len(dataloader) // gradient_accumulation_steps
     total_train_steps = num_update_steps_per_epoch * num_epochs
 
+    # memory tracker
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+
     # train loop
     step = -1
     tr_loss = 0.
@@ -275,6 +273,8 @@ def main(
                     step > 0 and
                     step % gradient_accumulation_steps == 0
                 ):
+                    gpu_mem_used_now = torch.cuda.memory_allocated()
+                    gpu_mem_used_peak = torch.cuda.max_memory_allocated()
                     last_lr = scheduler.get_last_lr()[0]
                     metrics = {
                         'epoch': round(
@@ -283,6 +283,8 @@ def main(
                         ),
                         'loss': tr_loss,
                         'learning_rate': last_lr,
+                        "gpu_mem_used_now": gpu_mem_used_now,
+                        "gpu_mem_used_peak": gpu_mem_used_peak,
                         # 'grad_norm': _grad_norm,
                     }
 

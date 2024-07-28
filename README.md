@@ -28,10 +28,10 @@ The key assumption here is that within a single data example (or batch) **the to
 Expert parallel will be able to achieve increased throughputs if the number of tokens to each expert are well-balanced.
 
 
-Emb, Attn | MoE | train_runtime | train_steps_per_sec
---|--|--|--
-FSDP2 | FSDP2 | 3478.11475 | 0.11672990375030036
-FSDP2 | megablocks | 3478.11475 | 0.11672990375030036
+Emb, Attn | MoE | train_runtime (s) | train_steps_per_sec | gpu_mem_used_peak (MiB)
+--|--|--|--|--
+FSDP2 | FSDP2 | 12345 | 0.033 | 54163
+FSDP2 | megablocks | 3478 | 0.117 | 46692
 
 
 

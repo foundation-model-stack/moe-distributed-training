@@ -19,7 +19,7 @@ def main(
     load_model_dtype='bfloat16', # FSDP shared params will take 
     attn_implementation='sdpa',
     use_megablocks_sharding: bool = False,
-    debug: bool = False,
+    truncate_model_for_debug: bool = False,
 ):
 
     parser = HfArgumentParser(
@@ -33,7 +33,7 @@ def main(
         attn_implementation=attn_implementation, ## UPDATED
     )
 
-    if debug:
+    if truncate_model_for_debug:
         # will just change to two layers for a quick run
         model.model.layers = model.model.layers[:2]
 
