@@ -77,6 +77,9 @@ def main(
         tokenizer.pad_token = tokenizer.eos_token
 
     # tokenize the dataset here, because we are not using SFTTrainer anymore
+    # https://github.com/foundation-model-stack/fms-hf-tuning/blob/main/README.md#pre-process-the-jsonjsonl-dataset
+    # - follow these instructions to prepare `data.json` that contains a single 
+    #   key "output"
     def convert_data(example):
         input_ids = tokenizer(example['output'])['input_ids']
         return {'input_ids': input_ids, 'labels': input_ids}
@@ -85,7 +88,6 @@ def main(
         convert_data
     ).remove_columns('output')
 
-    # taken from https://github.com/foundation-model-stack/fms-hf-tuning/blob/main/tuning/sft_trainer.py
     response_template_ids = tokenizer.encode(
         " ### Response", add_special_tokens=False
     )[2:]

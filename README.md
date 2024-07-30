@@ -1,20 +1,20 @@
-# FSDP2 with Megablocks
+# Distributed Training with Mixture-of-Experts (MoE)
 
-This repo demonstrates FSDP2 sharding using Databricks Megablocks, inspired by the blog https://pytorch.org/blog/training-moes/.
+This repo concerns the distributed training of MoE's. Here, we look at FSDP-type sharding using expert-parallel techniques like Databricks Megablocks (c.f., https://pytorch.org/blog/training-moes/).
 - explore FSDP2-style sharding with native `torch.DeviceMesh`.
 - compare differences between FSDP1 and FSDP2.
 
 We have two scripts:
-- [train_accelerate_fsdp2.py](./train_accelerate_fsdp2.py): Huggingface (HF) trainer has not yet integrated FSDP2, so this is a custom train loop implementation using HF Accelerate to handle things like gradient accumulation.
 - [train_fsdp1.py](./train_fsdp1.py): Uses HF trainer with its current integration of FSDP1.
+- [train_accelerate_fsdp2.py](./train_accelerate_fsdp2.py): Huggingface (HF) trainer has not yet integrated FSDP2, so this is a custom train loop implementation using HF Accelerate to handle things like gradient accumulation.
 
 Note:
-- These scripts are hardcoded to test the 47B MoE model `"mistralai/Mixtral-8x7B-Instruct-v0.1"`.
-- Also hardcoded to use `alpaca` with instruction tuning, the dataset is [`data.json`](./data.json).
+- These scripts are currently hardcoded to test the 47B MoE model `"mistralai/Mixtral-8x7B-Instruct-v0.1"`.
+- Also currently hardcoded to use `alpaca` with instruction tuning; for `train_accelerate_fsdp2.py` follow the [instructions here](https://github.com/foundation-model-stack/fms-hf-tuning/blob/main/README.md#pre-process-the-jsonjsonl-dataset) to prepare the instruction dataset.
 - Both scripts have an `use_megablocks_sharding`, when set to `True` activates expert parallel `megablocks`-type sharding.
 - Currently this was tested on `torch==2.3.1` and the comments are meant for this verison, however the implementation of FSDP2 did not seem to change much in the latest 2.4 release [see here](https://github.com/pytorch/pytorch/blob/main/torch/distributed/fsdp/fully_sharded_data_parallel.py).
 
-## What is Expert Parallel?
+## What is Expert Parallel For MoE Training?
 
 ![Preview1](./imgs/expert-parallel.png)
 
@@ -40,19 +40,6 @@ FSDP2 | megablocks | 3478 | 0.117 | 46692
 Install dependencies (will require CUDA_TOOLKIT to build megablocks):
 ```
 pip install -r requirements.txt
-```
-
-Running FSPD2 script uses torchrun, as there seems to be some problems with the `accelerate` launcher and FSDP2. Instead use `torchrun`; the below example runs the FSDP2 with megablocks expert parallel on 8 GPUs.
-```
-torchrun --nproc_per_node=8 \
-	--rdzv_backend c10d \
-	--rdzv_endpoint="localhost:0" \
-	--local-ranks-filter 0 --role rank \
-	train_accelerate_fsdp2.py \
-	--gradient_accumulation_steps 16 \
-	--use_megablocks_sharding True \
-	--debug True \
-	--learning_rate 5e-5
 ```
 
 Running FSDP1 script uses accelerate. The equivalent run to above would be 
@@ -82,6 +69,20 @@ accelerate launch \
     --logging_steps 1 \
 	--use_megablocks_sharding True
 ```
+
+Running FSPD2 script uses torchrun, as there seems to be some problems with the `accelerate` launcher and FSDP2. Instead use `torchrun`; the below example runs the FSDP2 with megablocks expert parallel on 8 GPUs.
+```
+torchrun --nproc_per_node=8 \
+	--rdzv_backend c10d \
+	--rdzv_endpoint="localhost:0" \
+	--local-ranks-filter 0 --role rank \
+	train_accelerate_fsdp2.py \
+	--gradient_accumulation_steps 16 \
+	--use_megablocks_sharding True \
+	--debug True \
+	--learning_rate 5e-5
+```
+
 
 ## Implementation Discussion
 
