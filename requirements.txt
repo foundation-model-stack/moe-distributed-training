@@ -1,8 +1,10 @@
 
-megablocks @ git+https://github.com/databricks/megablocks.git
+megablocks @ git+https://github.com/databricks/megablocks.git@bce5d7b2aaf5038bc93b36f76c2baf51c2939bd2
+
 
 torch == 2.3.1
 transformers 
 accelerate >= 0.29
 trl # for the dataloader
 tqdm
+fire
