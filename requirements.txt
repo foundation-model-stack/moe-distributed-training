@@ -8,3 +8,5 @@ accelerate >= 0.29
 trl # for the dataloader
 tqdm
 fire
+
+peft

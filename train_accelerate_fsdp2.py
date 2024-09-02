@@ -18,6 +18,9 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
 )
 from torch.utils.checkpoint import checkpoint
 
+from peft import LoraConfig, TaskType
+from utils import prepare_peft
+
 from tqdm.auto import tqdm, trange
 from torch.optim import AdamW
 from megablocks_utils.shard_moe_utils import shard_moe, get_moe_kwargs
@@ -55,6 +58,8 @@ def main(
     # max_grad_norm: float = 1.0,
     learning_rate: float = 1e-5,
     truncate_model_for_debug: bool = False,
+    expert_degree: int = None,
+    use_lora: bool = False,
 ):
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -109,13 +114,16 @@ def main(
 
     if use_megablocks_sharding:
 
+        if expert_degree is None:
+            expert_degree = world_size
+
         dp_mesh = shard_moe(
             model, 
             MixtralSparseMoeBlock, 
             checkpoint_name_or_path=MODEL_NAME,
             rank=rank,
             world_size=world_size,
-            ep_size=world_size,
+            ep_size=expert_degree,
             moe_kwargs=get_moe_kwargs(
                 model.config, 
                 has_bias=False,
@@ -152,7 +160,11 @@ def main(
     # - we cannot use accelerate's prepare model because there is no 
     #   FSDP2 integration yet
     def prepare_model(m: torch.nn.Module):
-        layers = m.model.layers
+        if not use_lora:
+            layers = m.model.layers
+        else:
+            layers = m.get_base_model().model.layers
+
         n_layers = len(layers)
         for layer_id, transformer_block in enumerate(tqdm(layers)):
             # As an optimization, do not reshard after forward for the last
@@ -193,6 +205,20 @@ def main(
             m, **fsdp_config, reshard_after_forward=True
         )
         return m
+
+    if use_lora:
+        peft_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=16,
+            lora_alpha=16,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        )
+        model = prepare_peft(
+            model, peft_config, 
+            gradient_checkpointing=True,
+            bf16=(load_model_dtype=='bfloat16'),
+            autocast_adapter_dtype=False, # do not upcast because FSDP cannot handle mixed types
+        )
 
     # prepare the model without accelerate
     model = prepare_model(model)
