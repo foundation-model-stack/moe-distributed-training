@@ -1,5 +1,5 @@
 
-from peft import PeftConfig, PeftModel
+from peft import PeftConfig
 from peft import get_peft_model
 from peft.utils import (
     prepare_model_for_kbit_training,
@@ -8,7 +8,6 @@ import torch
 
 from trl.trainer.utils import peft_module_casting_to_bf16
 
-import dataclasses
 import inspect
 from typing import Dict
 

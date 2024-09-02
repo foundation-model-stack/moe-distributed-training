@@ -7,7 +7,10 @@ from megablocks.layers.dmlp_registry import _REGISTRY
 # from megablocks.layers import mlp
 from .sparse_mlp2 import SparseMLPv2
 from megablocks.layers.moe import ParallelMLP
+from megablocks.layers.mlp import resolve_dtensor
+from megablocks.layers.router import LearnedRouter, _uniform_expert_assignment
 import torch
+import torch.nn.functional as F
 
 def update_mlp_registry():
     # patch the registry to point to our v2
@@ -34,4 +37,35 @@ def update_mlp_registry():
 
     # patch the forward function
     ParallelMLP.forward = forward
+
+    def forward_router(self, x):
+        if self.training and self.args.moe_jitter_eps is not None:
+            x = x * self.jitter(x)
+
+        _weight = resolve_dtensor(self.layer.weight)
+        _bias = None if self.layer.bias is None else resolve_dtensor(self.layer.bias)
+        # pylint: disable=not-callable
+        scores = F.linear(x.view(-1, x.shape[-1]), _weight, _bias).softmax(dim=-1)
+        expert_weights, expert_indices = self._top_k(scores)
+        if self.args.moe_normalize_expert_weights:
+            expert_weights = expert_weights / torch.norm(
+                expert_weights,
+                p=self.args.moe_normalize_expert_weights,
+                dim=-1,
+                keepdim=True,
+            )
+
+        expert_indices = (
+            _uniform_expert_assignment(
+                expert_indices,
+                self.args.moe_num_experts,
+            )
+            if self.args.uniform_expert_assignment
+            else expert_indices
+        )
+        return scores, expert_weights, expert_indices
+
+    # replace the forward function in the router
+    # - same as above
+    LearnedRouter.forward = forward_router
     

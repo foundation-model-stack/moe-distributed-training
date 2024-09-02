@@ -55,7 +55,7 @@ def main(
     lr_scheduler_type: str = 'linear',
     num_epochs: int = 1,
     num_warmup_steps: int = 0,
-    # max_grad_norm: float = 1.0,
+    max_grad_norm: float = 1.0,
     learning_rate: float = 1e-5,
     truncate_model_for_debug: bool = False,
     expert_degree: int = None,
@@ -117,7 +117,7 @@ def main(
         if expert_degree is None:
             expert_degree = world_size
 
-        dp_mesh = shard_moe(
+        device_mesh = shard_moe(
             model, 
             MixtralSparseMoeBlock, 
             checkpoint_name_or_path=MODEL_NAME,
@@ -142,17 +142,17 @@ def main(
                 layer.block_sparse_moe, REGISTRY_KEY, {'replicate'}
             )
     else:
-        dp_mesh = init_device_mesh(
+        device_mesh = init_device_mesh(
             "cuda", 
             (world_size,), mesh_dim_names=('dp', )
-        )['dp']
+        )
 
     mp_policy = MixedPrecisionPolicy(
         param_dtype=getattr(torch, load_model_dtype), 
         reduce_dtype=getattr(torch, load_model_dtype), 
     )
 
-    fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
+    fsdp_config = {"mesh": device_mesh, "mp_policy": mp_policy}
 
 
     # apply sharding on the model
@@ -292,10 +292,15 @@ def main(
 
                 tr_loss += loss.item() / gradient_accumulation_steps
 
-                # having some problems with clipping now since we have a mixture
-                # of regular and DTensors at the moment
-                # if accelerator.sync_gradients:
-                #     # _grad_norm = accelerator.clip_grad_value_(model.parameters(), max_grad_norm)
+                if accelerator.sync_gradients:
+                    _grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
+                    try:
+                        # if its a DTensor we need to do this
+                        _grad_norm = _grad_norm.to_local()
+                    except:
+                        pass
+
+                    _grad_norm = _grad_norm.item()
 
                 if (
                     step > 0 and
@@ -313,7 +318,7 @@ def main(
                         'learning_rate': last_lr,
                         "gpu_mem_used_now": gpu_mem_used_now,
                         "gpu_mem_used_peak": gpu_mem_used_peak,
-                        # 'grad_norm': _grad_norm,
+                        'grad_norm': _grad_norm,
                     }
 
                     # reset

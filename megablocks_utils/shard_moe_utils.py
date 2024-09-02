@@ -152,19 +152,26 @@ def assign_mlp_v2_weights(
                         T = T.t()
                 data.append(T)
 
-            # concat on dim 0 and distribute
-            param = torch.concat(data, dim=DIM_EXPERT)
-            if KEY_ROUTER not in weight_name:
-                param = torch.nn.Parameter(
-                    distribute_tensor(param, device_mesh, placements)
-                )
-            else:
-                param = torch.nn.Parameter(
-                    param.to(torch.cuda.current_device())
-                )
-            name = weight_name.split('.')
+            # get the module we want to shard
+            name = weight_name.split(".")
             path, name = ".".join(name[:-1]), name[-1]
             mod = dmoe.get_submodule(path)
+
+            # get 
+            mod_dtype = getattr(mod, name).dtype
+            requires_grad = getattr(mod, name).requires_grad
+
+            # concat on dim 0 and distribute
+            param = torch.concat(data, dim=DIM_EXPERT).to(mod_dtype)
+            _placements = placements
+            if KEY_ROUTER in weight_name:
+                # - the router needs to be replicated
+                _placements = [Replicate() for _ in range(len(placements))]
+
+            param = torch.nn.Parameter(
+                distribute_tensor(param, device_mesh, _placements),
+                requires_grad=requires_grad,
+            )
             mod.register_parameter(name, param)
 
 def shard_moe(
@@ -267,4 +274,4 @@ def shard_moe(
         )
 
 
-    return device_mesh[key_dp]
+    return device_mesh
