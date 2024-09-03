@@ -7,10 +7,17 @@ from megablocks.layers.dmlp_registry import _REGISTRY
 # from megablocks.layers import mlp
 from .sparse_mlp2 import SparseMLPv2
 from megablocks.layers.moe import ParallelMLP
+from megablocks.layers.dmoe import ParallelDroplessMLP
 from megablocks.layers.mlp import resolve_dtensor
 from megablocks.layers.router import LearnedRouter, _uniform_expert_assignment
+from megablocks.layers import mpu
 import torch
 import torch.nn.functional as F
+
+# if is_scattermoe_available():
+import scattermoe
+from scattermoe.parallel_experts import parallel_linear as scattered_experts
+from functools import partial
 
 def update_mlp_registry():
     # patch the registry to point to our v2
@@ -37,6 +44,105 @@ def update_mlp_registry():
 
     # patch the forward function
     ParallelMLP.forward = forward
+
+    # in the case of scattermoe, replace ParallelDroplessMLP.permute_and_compute
+    # instead to this version for our v2
+    def scattermoe_permute_and_compute(
+        self,
+        x,
+        tokens_per_expert,
+        indices,
+        bin_ids,
+        expert_weights,
+        bins,
+        expert_capactiy,
+        top_k,
+    ):
+        with torch.no_grad():
+            # num_experts if from ParallelMLP
+            padded_block_idxs, expert_offsets = scattermoe.kernels.ops.padded_block_indices(
+                bin_ids, mpu.experts_per_rank(self.args)
+            )
+
+        hidden_states = scattered_experts(
+            x,
+            self.mlp.w1.view(
+                -1, self.ffn_hidden_size, self.hidden_size
+            ).to_local().permute(0, 2, 1),
+            1,
+            bin_ids, # sorted_expert_idxs,
+            indices, # sorted_scattered_idxs,
+            padded_block_idxs,
+            expert_offsets,
+            gates=None, # we dont have router weights
+            grouped_in=False,
+            grouped_out=True,
+        )
+        hidden_states2 = scattered_experts(
+            x,
+            self.mlp.w3.view(
+                -1, self.ffn_hidden_size, self.hidden_size
+            ).to_local().permute(0, 2, 1),
+            1,
+            bin_ids, # sorted_expert_idxs,
+            indices, # sorted_scattered_idxs,
+            padded_block_idxs,
+            expert_offsets,
+            gates=None, # we dont have router weights
+            grouped_in=False,
+            grouped_out=True,
+        )
+        hidden_states = F.silu(hidden_states) * hidden_states2
+        return scattered_experts(
+            hidden_states,
+            self.mlp.w2.view(
+                -1, self.ffn_hidden_size, self.hidden_size
+            ).to_local(),
+            1,
+            bin_ids, # sorted_expert_idxs,
+            indices, # sorted_scattered_idxs,
+            padded_block_idxs,
+            expert_offsets,
+            gates=None, # we dont have router weights
+            grouped_in=True,
+            grouped_out=False,
+        )
+
+    def permute_and_compute(
+        self,
+        x,
+        tokens_per_expert,
+        indices,
+        bin_ids,
+        expert_weights,
+        bins,
+        expert_capactiy,
+        top_k,
+    ):
+
+        if self.args.mlp_impl == 'sparse':
+            _func = self.sparse_permute_and_compute
+        elif self.args.mlp_impl == 'scattermoe':
+            # see above
+            _func = partial(scattermoe_permute_and_compute, self)
+        else:
+            _func = self.grouped_permute_and_compute
+
+        return _func(
+            x,
+            tokens_per_expert,
+            indices,
+            bin_ids,
+            expert_weights,
+            bins,
+            expert_capactiy,
+            top_k,
+        )
+
+    # reg SparseMLPv2 in place for the init functions
+    _REGISTRY['mlp']['scattermoe'] = SparseMLPv2
+    
+    ParallelDroplessMLP.permute_and_compute = permute_and_compute
 
     def forward_router(self, x):
         if self.training and self.args.moe_jitter_eps is not None:
@@ -68,4 +174,3 @@ def update_mlp_registry():
     # replace the forward function in the router
     # - same as above
     LearnedRouter.forward = forward_router
-    

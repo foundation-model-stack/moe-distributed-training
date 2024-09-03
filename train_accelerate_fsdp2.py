@@ -52,6 +52,7 @@ def main(
     per_device_train_batch_size: int = 1,
     gradient_accumulation_steps: int = 1,
     use_megablocks_sharding: bool = False,
+    use_scattermoe: bool = False,
     lr_scheduler_type: str = 'linear',
     num_epochs: int = 1,
     num_warmup_steps: int = 0,
@@ -129,6 +130,10 @@ def main(
                 has_bias=False,
                 fp16=(load_model_dtype == 'float16'),
                 bf16=(load_model_dtype == 'bfloat16'),
+                mlp_impl=(
+                    "sparse" if not use_scattermoe else
+                    "scattermoe"
+                )
             ),
         )
 

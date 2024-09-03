@@ -28,6 +28,7 @@ def get_moe_kwargs(
     has_bias: bool = False, # if the MOE has bias
     fp16: bool = False,
     bf16: bool = False,
+    mlp_impl: str = 'sparse',
 ):
     return {
         "hidden_size": config.hidden_size,
@@ -40,6 +41,7 @@ def get_moe_kwargs(
         "moe_normalize_expert_weights": True,
         "fp16": fp16,
         "bf16": bf16,
+        "mlp_impl": mlp_impl,
     }
 
 # trick to get the resolved cache file to acccess the safetensor

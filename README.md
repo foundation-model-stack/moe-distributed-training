@@ -22,6 +22,11 @@ In the data parallel dimension, seperate shards (stylised as white and grey in t
 
 The key assumption here is that within a single data example (or batch) **the tokens assigned to each expert is roughly the same**, so each device will run in parallel for approximately the same amount of time, then moving on to the next batch. 
 - The challenge is to then manage slight differences in token numbers without dropping them; this is addressed by the `DroplessMoE` in megablocks using sparse matmuls.
+- for [train_accelerate_fsdp2.py](./train_accelerate_fsdp2.py) there is a choice for running scattermoe in place of the megablock kernels when passing `use_scattermoe=True`. But for this please install:
+    ```
+    pip install git+https://github.com/shawntan/scattermoe.git
+    ```
+
 
 ### Performance
 
