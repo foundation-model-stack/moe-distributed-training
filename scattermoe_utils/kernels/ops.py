@@ -19,12 +19,13 @@ def _scatter2scatter_configs():
 def _scatter2scatter_lora(
     X_ptr, stride_xm, stride_xk,
     W_ptr, stride_we, stride_wk, stride_wn,
-    A_ptr, stride_ae, stride_ak, 
-    B_ptr, stride_be, stride_bn, 
+    A_ptr, stride_ae, stride_ak, stride_ar,
+    B_ptr, stride_be, stride_br, stride_bn,
     Y_ptr, stride_ym, stride_yn,
     grouped_idx_ptr, expert_idxs_ptr, block_start_idx_ptr,
     FAN_OUT: tl.constexpr,
     M, K: tl.constexpr, N: tl.constexpr, E: tl.constexpr,
+    R: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ACC_TYPE: tl.constexpr,
     OUT_M,
@@ -82,6 +83,9 @@ def _scatter2scatter_lora(
     N_block = N_block_id * BLOCK_N  + tl.arange(0, BLOCK_N)
     N_mask = N_block < N
 
+    # - R range for lora dimension
+    R_range = tl.arange(0, R)
+
     # X: dimensions M, K
     X_blk_ptrs = X_ptr + M_in_idx[:, None] * stride_xm + K_block[None, :] * stride_xk
 
@@ -89,8 +93,8 @@ def _scatter2scatter_lora(
     # A: dimensions E, K, lora_r
     # B: dimensions E,    lora_r, N
     W_blk_ptrs = W_ptr + E_idx * stride_we + K_block[:, None] * stride_wk + N_block[None, :] * stride_wn
-    A_blk_ptrs = A_ptr + E_idx * stride_ae + K_block[:, None] * stride_ak 
-    B_blk_ptrs = B_ptr + E_idx * stride_be                                + N_block[None, :] * stride_bn
+    A_blk_ptrs = A_ptr + E_idx * stride_ae + K_block[:, None] * stride_ak                                + R_range[None, :] * stride_ar
+    B_blk_ptrs = B_ptr + E_idx * stride_be                                + N_block[None, :] * stride_bn + R_range[:, None] * stride_br
 
     # b can be loaded outside because it has no dependence on input dimension K
     b = tl.load(B_blk_ptrs, mask=N_mask[None, :])
@@ -104,14 +108,13 @@ def _scatter2scatter_lora(
         if NO_K_MASK:
             # - if K mask not required
             x = tl.load(X_blk_ptrs, mask=E_mask[:, None])
+            a = tl.load(A_blk_ptrs)
 
             if NO_N_MASK or K_block_id < (iters - 1):
                 # - if N mask also not reqiured
                 w = tl.load(W_blk_ptrs)
-                a = tl.load(A_blk_ptrs)
             else:
                 w = tl.load(W_blk_ptrs, mask=N_mask[None, :])
-                a = tl.load(A_blk_ptrs, mask=N_mask[None, :])
         else:
             # - construct K mask (NO_N_MASK has no effect here)
             K_mask = (K_block_id * BLOCK_K + K_block) < K
@@ -145,7 +148,7 @@ def _scatter2scatter_lora(
 # - in lora adaption the combined weights are W + A*B*scaling
 # - scaling is typically lora_alp / lora_r
 def scatter2scatter_lora(
-    X, W, A, B, scaling,
+    X, W, A, B, lora_alp,
     sorted_expert_idxs, sorted_scattered_idxs, k,
     padded_block_idxs, x_grouped=False, y_grouped=False,
     out=None
@@ -179,10 +182,10 @@ def scatter2scatter_lora(
             X, X.stride(0), X.stride(1),
             # W_ptr, stride_we, stride_wk, stride_wn,
             W, W.stride(0), W.stride(1), W.stride(2),
-            # A_ptr, stride_ae, stride_ak, 
-            A, A.stride(0), A.stride(1), 
-            # B_ptr, stride_be, stride_bn, 
-            B, B.stride(0), B.stride(1), 
+            # A_ptr, stride_ae, stride_ak, stride_ar,
+            A, A.stride(0), A.stride(1), A.stride(2),
+            # B_ptr, stride_be, stride_br, stride_bn,
+            B, B.stride(0), B.stride(1), B.stride(2),
             # Y_ptr, stride_ym, stride_yn,
             O, O.stride(0), O.stride(1),
             grouped_idx_ptr=sorted_scattered_idxs,
@@ -192,10 +195,11 @@ def scatter2scatter_lora(
             M=X.size(0),
             K=X.size(1),
             N=O.size(1), E=W.size(0),
+            R=A.size(2),
             BLOCK_M=BLOCK_M,
             ACC_TYPE=tl.float32,
             OUT_M=O.size(0),
-            alpha=scaling,
+            scaling=(lora_alp / A.size(2)),
             allow_tf32=True,
             x_grouped=x_grouped, y_grouped=y_grouped,
         )
