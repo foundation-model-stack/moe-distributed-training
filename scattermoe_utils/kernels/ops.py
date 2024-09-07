@@ -35,17 +35,36 @@ def _scatter2scatter_lora(
 ):
     pid = tl.program_id(axis=0)
 
+    # The grid is assumed to be num_experts * N_BLOCK_COUNT. The input tokens are
+    # on the M dimension, that is blocked. The first task is to identify which expert
+    # is being worked on by the kernel instance.
+    # - block_start_idx_ptr contains offesets into blocks of M. 
+    # - find E_idx to extract out the start index. 
+    # - use start index to instantiate the M_block
+    # - M_block indices the X's worked on by this kernel instance
     N_BLOCK_COUNT = tl.cdiv(N, BLOCK_N)
-    M_block_id = pid // N_BLOCK_COUNT
+    E_idx = pid // N_BLOCK_COUNT
     N_block_id = pid % N_BLOCK_COUNT
     M_range = tl.arange(0, BLOCK_M)
-    block_start_idx = tl.load(block_start_idx_ptr + M_block_id)
-    # M_block = tl.max_contiguous((block_start_idx + M_range) % OUT_M, BLOCK_M)
+    block_start_idx = tl.load(block_start_idx_ptr + E_idx)
     M_block = tl.max_contiguous(block_start_idx + M_range, BLOCK_M)
+
+    # Assumption: expert_idxs_ptr is a sorted list of expert ids.
+    # - load expert_idxs_ptr into E_idxs
+    # - construct the E_mask so we operate only on expert for this kernel instance (e.g., E_idx)
     E_idxs = tl.load(expert_idxs_ptr + M_block, mask=M_block < (FAN_OUT * M), other=E)
-    E_idx = tl.min(E_idxs)
+    # NOTE: this was in the original code, but do not think it is needed. 
+    # - the M_block is offset by block_start_idx
+    # E_idx = tl.min(E_idxs)
     E_mask = E_idxs == E_idx
+
+    # Assumption: grouped_idx_ptr puts X in the order as expected by expert_idxs_ptr.
+    # - same length as expert_idxs_ptr
+    # - this is used ONLY if grouping of X or Y (output) is required.
     M_idx = tl.load(grouped_idx_ptr + M_block, mask=E_mask, other=0)
+
+    # depending on grouped settings, set M_in_idx (input) and M_out_idx (output) appropriately
+    # - if already grouped, then M_idx is not required and use M_block
     if x_grouped:
         M_in_idx = M_block
     else:
@@ -56,41 +75,58 @@ def _scatter2scatter_lora(
     else:
         M_out_idx = M_idx
 
+    # - K_block for input dimension
     K_block = tl.arange(0, BLOCK_K)
 
+    # - N_block for output dimension
     N_block = N_block_id * BLOCK_N  + tl.arange(0, BLOCK_N)
     N_mask = N_block < N
-    # N_block = tl.max_contiguous(tl.multiple_of(N_block % N, BLOCK_N), BLOCK_N)
-    # N_block = N_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
 
+    # X: dimensions M, K
     X_blk_ptrs = X_ptr + M_in_idx[:, None] * stride_xm + K_block[None, :] * stride_xk
-    W_blk_ptrs = W_ptr + K_block[:, None] * stride_wk + N_block[None, :] * stride_wn + E_idx * stride_we
-    A_blk_ptrs = A_ptr + K_block[:, None] * stride_ak + E_idx * stride_ae
-    B_blk_ptrs = B_ptr + N_block[None, :] * stride_bn + E_idx * stride_be
 
-    # b can be loaded outside because it has no dependence on K
+    # W: dimensions E, K,         N
+    # A: dimensions E, K, lora_r
+    # B: dimensions E,    lora_r, N
+    W_blk_ptrs = W_ptr + E_idx * stride_we + K_block[:, None] * stride_wk + N_block[None, :] * stride_wn
+    A_blk_ptrs = A_ptr + E_idx * stride_ae + K_block[:, None] * stride_ak 
+    B_blk_ptrs = B_ptr + E_idx * stride_be                                + N_block[None, :] * stride_bn
+
+    # b can be loaded outside because it has no dependence on input dimension K
     b = tl.load(B_blk_ptrs, mask=N_mask[None, :])
 
+    # accumulate loop over input dimension, for iters number of times
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
     iters = tl.cdiv(K, BLOCK_K)
     for K_block_id in range(0, iters):
+
+        # - load x, w, a quantities depending on NO_K_MASK or NO_N_MASK
         if NO_K_MASK:
+            # - if K mask not required
             x = tl.load(X_blk_ptrs, mask=E_mask[:, None])
+
             if NO_N_MASK or K_block_id < (iters - 1):
+                # - if N mask also not reqiured
                 w = tl.load(W_blk_ptrs)
+                a = tl.load(A_blk_ptrs)
             else:
                 w = tl.load(W_blk_ptrs, mask=N_mask[None, :])
+                a = tl.load(A_blk_ptrs, mask=N_mask[None, :])
         else:
+            # - construct K mask (NO_N_MASK has no effect here)
             K_mask = (K_block_id * BLOCK_K + K_block) < K
             x = tl.load(X_blk_ptrs, mask=E_mask[:, None] & K_mask[None, :])
             w = tl.load(W_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
             a = tl.load(A_blk_ptrs, mask=K_mask[:, None])
 
-        # accumulate
-        # - acummulate the base layer
+        # Y = X * (W + A*B*scaling)
+        #   = X * W + X * A * B * scaling
+        # - acummulate base layer
         acc += tl.dot(x, w, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
 
-        # - accumulate the adapter
+        # - accumulate adapter
+        # - interim = X * A * scaling
+        # - interm wil be of dimensions M_block by lora_r
         interim = tl.dot(x, a, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
         interim *= scaling
         acc += tl.dot(interim, b, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
@@ -104,6 +140,10 @@ def _scatter2scatter_lora(
     Y_blk_ptrs = Y_ptr + (M_out_idx[:, None] * stride_ym + N_block[None, :] * stride_yn)
     tl.store(Y_blk_ptrs, acc, mask=E_mask[:, None] & N_mask[None, :])
 
+# This is the lora enabled version of scatter2scatter, where alongisde the weights
+# W, we take in the adapters A and B.
+# - in lora adaption the combined weights are W + A*B*scaling
+# - scaling is typically lora_alp / lora_r
 def scatter2scatter_lora(
     X, W, A, B, scaling,
     sorted_expert_idxs, sorted_scattered_idxs, k,
@@ -113,7 +153,9 @@ def scatter2scatter_lora(
     assert sorted_scattered_idxs.size(0) == sorted_expert_idxs.size(0)
     assert sorted_scattered_idxs.size(0) == X.size(0) * k
 
-    ## TODO: do size checks on A, B
+    assert W.size(1) == A.size(1), "A has incorrect input size."
+    assert W.size(2) == B.size(2), "B has incorrect output size."
+    assert A.size(2) == B.size(1), "A and B have inconsistent inner dims."
 
     # Pre-kernel setup
     x_dim = X.size(-1)
