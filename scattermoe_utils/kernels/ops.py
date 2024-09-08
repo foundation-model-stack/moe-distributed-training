@@ -211,9 +211,12 @@ def _config_XtY():
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32}, num_stages=4, num_warps=4),
     ]
 
-def group_bwd_AB(DY, X, A, B, expert_offsets, E, lora_alp, lora_r):
-    DA = torch.zeros((E, X.size(-1), lora_r), device=DY.device, dtype=DY.dtype)
-    DB = torch.zeros((E, lora_r, DY.size(-1)), device=DY.device, dtype=DY.dtype)
+def group_bwd_AB(DY, X, A, B, scaling, expert_offsets, E):
+
+    assert A.size(2) == B.size(1), "A and B have inconsistent inner dims."
+
+    DA = torch.zeros((E, X.size(-1), A.size(2)), device=DY.device, dtype=DY.dtype)
+    DB = torch.zeros((E, A.size(2), DY.size(-1)), device=DY.device, dtype=DY.dtype)
     def grid(META):
         grid = (
             E * triton.cdiv(META['K'], META['BLOCK_K']),
@@ -221,26 +224,28 @@ def group_bwd_AB(DY, X, A, B, expert_offsets, E, lora_alp, lora_r):
         )
         return grid
     
+    At = A.permute(0, 2, 1)
+    Bt = B.permute(0, 2, 1)
+    
     with torch.cuda.device(DY.device):
         _groupXtY_lora[grid](
             # DY_ptr, stride_dym, stride_dyk,
             DY, DY.stride(0), DY.stride(1),
             # X_ptr, stride_xm, stride_xn,
             X, X.stride(0), X.stride(1),
-            # DA_ptr, stride_dae, stride_dak,
-            DA, DA.stride(0), DA.stride(1),
-            # DB_ptr, stride_dbe, stride_dbn,
-            DB, DB.stride(0), DB.stride(1), 
-            # A_ptr, stride_ae, stride_ak, 
-            A.permute(0,2,1), A.stride(0), A.stride(2), 
-            # B_ptr, stride_be, stride_bn, 
-            B.permute(0,2,1), B.stride(0), B.stride(2), 
+            # DA_ptr, stride_dae, stride_dan, stride_dar
+            DA, DA.stride(0), DA.stride(1), DA.stride(2),
+            # DB_ptr, stride_dbe, stride_dbr, stride_dbn,
+            DB, DB.stride(0), DB.stride(1), DB.stride(2),
+            # At_ptr, stride_ae, stride_ar, stride_an,
+            At, At.stride(0), At.stride(1), At.stride(2),
+            # Bt_ptr, stride_be, stride_bk, stride_br,
+            Bt, Bt.stride(0), Bt.stride(1), Bt.stride(2),
             # expert_offsets_ptr,
             expert_offsets,
             # K: tl.constexpr, N: tl.constexpr,
-            M=DY.size(0), N=DY.size(-1), K=X.size(-1),
-            lora_r=lora_r, lora_alp=lora_alp,
-            # ACC_TYPE: tl.constexpr,
+            M=DY.size(0), N=DY.size(-1), K=X.size(-1), R=A.size(2),
+            scaling=scaling,
             ACC_TYPE=tl.float32,
             allow_tf32=True
         )
@@ -255,67 +260,107 @@ def group_bwd_AB(DY, X, A, B, expert_offsets, E, lora_alp, lora_r):
 def _groupXtY_lora(
     DY_ptr, stride_dym, stride_dyk,
     X_ptr, stride_xm, stride_xn,
-    DA_ptr, stride_dae, stride_dak, 
-    DB_ptr, stride_dbe, stride_dbn,
-    At_ptr, stride_ae, stride_ak,  # transposed
-    Bt_ptr, stride_be, stride_bn,  # transposed
+    DA_ptr, stride_dae, stride_dan, stride_dar,
+    DB_ptr, stride_dbe, stride_dbr, stride_dbk,
+    At_ptr, stride_ae, stride_ar, stride_an,  # transposed
+    Bt_ptr, stride_be, stride_bk, stride_br,  # transposed
     expert_offsets_ptr,
-    M, K: tl.constexpr, N: tl.constexpr,
-    lora_r, lora_alp,
+    M, K: tl.constexpr, N: tl.constexpr, R: tl.constexpr,
+    scaling,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ACC_TYPE: tl.constexpr,
     allow_tf32: tl.constexpr,
     NO_K_MASK: tl.constexpr, NO_N_MASK: tl.constexpr
 ):
+
+    # this function is required for computing the weight gradients as per the
+    # lora updates:
+    # Y = X * (W + A*B*scaling)
+    #   = X * W + X * A * B * scaling
+
+    # Consider a function f over domain R^K, i.e., f(Y)
+    # - Let DY the be gradients flowing backwards, i.e., DY = df/dY
+    # - Let DY be of dimensions M, K, where K is from the domain of f and M is 
+    #   sequence.
+    # - then the gradients DA for adapter A will be DA = X^t * DY * B^T * scaling
+    #   and the gradients DB for adapter B will be DB = A^t * X^t * DY * scaling
+
+    # The 2D grid is assumed to be:
+    # (num_experts * K_BLOCK_COUNT, N_BLOCK_COUNT)
+    # - the input dimension is N
+    # - the output dimension is K
+    # - X and DY are assumed to be grouped.
+    # - expert_offsets_ptr are the offsets for accessing the expert groups.
+
+    # handling pid0 and pid1
+    # - memory swizzling for minimizing shared memory conflicts
     pid0 = tl.program_id(axis=0)
     pid1 = tl.program_id(axis=1)
     num0 = tl.num_programs(0)
     num1 = tl.num_programs(1)
     pid1, pid0 = tl.swizzle2d(pid1, pid0, num1, num0, 128)
 
+    # - get E_idx, K_block_id, N_block_id
     K_BLOCK_COUNT = tl.cdiv(K, BLOCK_K)
     E_idx = pid0 // K_BLOCK_COUNT
     K_block_id = pid0 % K_BLOCK_COUNT
     N_block_id = pid1
 
+    # - get the offset and ending of the expert group
+    # - use E_idx that points ot the expert, 
+    # - start_idx is the offset. end_idx indicates where the group ends.
     if E_idx == 0:
         start_idx = 0
     else:
         start_idx = tl.load(expert_offsets_ptr + E_idx - 1).to(tl.int32)
     end_idx = tl.load(expert_offsets_ptr + E_idx).to(tl.int32)
 
-    K_block = K_block_id * BLOCK_K + tl.arange(0, BLOCK_K)
-    K_mask = K_block < K
-    K_block = tl.max_contiguous(tl.multiple_of(K_block % K, BLOCK_K), BLOCK_K)
-
+    # - get the N_block for the input dimension
     N_block = N_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
     N_mask = N_block < N
     N_block = tl.max_contiguous(tl.multiple_of(N_block % N, BLOCK_N), BLOCK_N)
 
-    # the K and B_blocks are transposed
-    At_blk_ptrs = At_ptr + K_block[None, :] * stride_ak + E_idx * stride_ae
-    Bt_blk_ptrs = Bt_ptr + N_block[:, None] * stride_bn + E_idx * stride_be
+    # - get the K_block for the output dimension
+    K_block = K_block_id * BLOCK_K + tl.arange(0, BLOCK_K)
+    K_mask = K_block < K
+    K_block = tl.max_contiguous(tl.multiple_of(K_block % K, BLOCK_K), BLOCK_K)
+
+    # - R range for lora dimension
+    R_range = tl.arange(0, R)
+
+    # - M block for indices dimension
+    M_block = tl.max_contiguous(start_idx + tl.arange(0, BLOCK_M), BLOCK_M)
+
+    # At: dimensions E, lora_r, N (transposed)
+    # Bt: dimensions E, K, lora_r (transposed)
+    At_blk_ptrs = At_ptr + E_idx * stride_ae + N_block[None, :] * stride_an + R_range[:, None] * stride_ar
+    Bt_blk_ptrs = Bt_ptr + E_idx * stride_be + K_block[:, None] * stride_bk + R_range[None, :] * stride_br
+
+    # - get the at and bt (transposed) weights
+    # - do not depend on indices dimension so can be loaded outside of loop
+    if NO_N_MASK:
+        at = tl.load(At_blk_ptrs)
+    else:
+        at = tl.load(At_blk_ptrs, mask=N_mask[None, :])
 
     if NO_K_MASK:
-        a = tl.load(At_blk_ptrs)
         bt = tl.load(Bt_blk_ptrs)
     else:
-        # the masks are transposed
-        a = tl.load(At_blk_ptrs, mask=K_mask[None, :])
-        bt = tl.load(Bt_blk_ptrs, mask=N_mask[:, None])
+        bt = tl.load(Bt_blk_ptrs, mask=K_mask[:, None])
 
-    scaling = lora_alp / lora_r
+    # - iterate over the (grouped) expert indices
     if end_idx > start_idx:
-        M_block = tl.max_contiguous(start_idx + tl.arange(0, BLOCK_M), BLOCK_M)
 
         M_idxs = M_block
-        xt_blk_ptrs = X_ptr + K_block[:, None] * stride_xn + M_idxs[None, :] * stride_xm
+        xt_blk_ptrs = X_ptr +  M_idxs[None, :] * stride_xm + K_block[:, None] * stride_xn
         dy_blk_ptrs = DY_ptr + M_idxs[:, None] * stride_dym + N_block[None, :] * stride_dyk
 
         acc_A = tl.zeros((BLOCK_K, lora_r), dtype=ACC_TYPE)
         acc_B = tl.zeros((lora_r, BLOCK_N), dtype=ACC_TYPE)
         iters = tl.cdiv(end_idx - start_idx, BLOCK_M)
         for i in range(0, iters):
+
+            # - get the M mask 
             M_mask = (i * BLOCK_M + M_block) < end_idx
             if NO_K_MASK:
                 xt = tl.load(xt_blk_ptrs, mask=M_mask[None, :])
@@ -339,11 +384,11 @@ def _groupXtY_lora(
 
 
         # this one is not transposed
-        DA_blk_ptrs = DA_ptr + E_idx * stride_dae + K_block[:, None] * stride_dak 
+        DA_blk_ptrs = DA_ptr + E_idx * stride_dae + K_block[:, None] * stride_dan 
         acc_A = acc_A.to(DA_blk_ptrs.dtype.element_ty)
         tl.store(DA_blk_ptrs, acc_A, mask=K_mask[:, None])
 
-        DB_blk_ptrs = DB_ptr + E_idx * stride_dbe + N_block[None, :] * stride_dbn
+        DB_blk_ptrs = DB_ptr + E_idx * stride_dbe + N_block[None, :] * stride_dbk
         acc_B = acc_B.to(DB_blk_ptrs.dtype.element_ty)
         tl.store(DB_blk_ptrs, acc_B, mask=N_mask[None, :])
 
