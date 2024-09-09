@@ -230,9 +230,6 @@ def group_bwd_AB(DY, X, A, B, scaling, expert_offsets, E):
         )
         return grid
     
-    At = A.permute(0, 2, 1)
-    Bt = B.permute(0, 2, 1)
-    
     with torch.cuda.device(DY.device):
         _groupXtY_lora[grid](
             # DY_ptr, stride_dym, stride_dyn,
@@ -243,10 +240,10 @@ def group_bwd_AB(DY, X, A, B, scaling, expert_offsets, E):
             DA, DA.stride(0), DA.stride(1), DA.stride(2),
             # DB_ptr, stride_dbe, stride_dbr, stride_dbn,
             DB, DB.stride(0), DB.stride(1), DB.stride(2),
-            # At_ptr, stride_ae, stride_ar, stride_ak,
-            At, At.stride(0), At.stride(1), At.stride(2),
-            # Bt_ptr, stride_be, stride_bn, stride_br,
-            Bt, Bt.stride(0), Bt.stride(1), Bt.stride(2),
+            # A_ptr, stride_ae, stride_ak, stride_ar,
+            A, A.stride(0), A.stride(1), A.stride(2),
+            # B_ptr, stride_be, stride_br, stride_bn,
+            B, B.stride(0), B.stride(1), B.stride(2),
             # expert_offsets_ptr,
             expert_offsets,
             # K: tl.constexpr, N: tl.constexpr,
@@ -268,8 +265,8 @@ def _groupXtY_lora(
     X_ptr, stride_xm, stride_xk,
     DA_ptr, stride_dae, stride_dak, stride_dar,
     DB_ptr, stride_dbe, stride_dbr, stride_dbn,
-    At_ptr, stride_ae, stride_ar, stride_ak,  # transposed
-    Bt_ptr, stride_be, stride_bn, stride_br,  # transposed
+    A_ptr, stride_ae, stride_ak, stride_ar,  # transposed
+    B_ptr, stride_be, stride_br, stride_bn,  # transposed
     expert_offsets_ptr,
     M, K: tl.constexpr, N: tl.constexpr, R: tl.constexpr,
     scaling,
@@ -339,8 +336,8 @@ def _groupXtY_lora(
 
     # At: dimensions E, lora_r, K (transposed)
     # Bt: dimensions E, N, lora_r (transposed)
-    At_blk_ptrs = At_ptr + E_idx * stride_ae + K_block[None, :] * stride_ak + R_range[:, None] * stride_ar
-    Bt_blk_ptrs = Bt_ptr + E_idx * stride_be + N_block[:, None] * stride_bn + R_range[None, :] * stride_br
+    At_blk_ptrs = A_ptr + E_idx * stride_ae + K_block[None, :] * stride_ak + R_range[:, None] * stride_ar
+    Bt_blk_ptrs = B_ptr + E_idx * stride_be + N_block[:, None] * stride_bn + R_range[None, :] * stride_br
 
     # - iterate over the (grouped) expert indices (sequence)
     # - check if end_idx and start_idx are valid
