@@ -47,14 +47,17 @@ class ParallelLinearLora(torch.autograd.Function):
         ctx.lora_r = lora_r
         ctx.lora_alp = lora_alp
         return output
+
     @staticmethod
     def backward(ctx, grad_out):
-        (x, expert_weights,
-         expert_lora_A, expert_lora_B, 
-         sorted_expert_idxs,
-         sorted_scattered_idxs,
-         padded_block_idxs, expert_offsets,
-         gates, output_expanded) = ctx.saved_tensors
+        (
+            x, expert_weights,
+            expert_lora_A, expert_lora_B, 
+            sorted_expert_idxs,
+            sorted_scattered_idxs,
+            padded_block_idxs, expert_offsets,
+            gates, output_expanded
+        ) = ctx.saved_tensors
         k = ctx.k
         lora_r = ctx.lora_r
         lora_alp = ctx.lora_alp
@@ -72,18 +75,26 @@ class ParallelLinearLora(torch.autograd.Function):
             gate_fan = 1
             grouped_grad_out = None
 
+        # group_bwd_AB only operates on grouped grad_out and x.
         if grouped_out:
             grouped_grad_out = grad_out
         else:
-            grouped_grad_out = orig_kernels.ops.group(grad_out, sorted_scattered_idxs,
-                                                 fan_out=gate_fan, coeff=gates_flat,
-                                                 out=grouped_grad_out)
+            # - if grad_out is not grouped, need to do it here
+            grouped_grad_out = orig_kernels.ops.group(
+                grad_out, sorted_scattered_idxs,
+                fan_out=gate_fan, coeff=gates_flat,
+                out=grouped_grad_out
+            )
+
         if grouped_in:
             grouped_x = x
             d_expanded_input = None
         else:
+            # - if x is not grouped, need to do it here
             grouped_x = orig_kernels.ops.group(x, sorted_scattered_idxs, fan_out=k)
             d_expanded_input = grouped_x
+
+        # 1. compute weight gradients on the grouped grad_out and x
         d_weights_A, d_weights_B = ops.group_bwd_AB(
             DY=grouped_grad_out, X=grouped_x,
             A=expert_lora_A, B=expert_lora_B,
@@ -94,32 +105,38 @@ class ParallelLinearLora(torch.autograd.Function):
         )
 
         # NOTE: this maybe can be fused
+        # 2. compute the input gradients.
+        # - the operation Y = X * (W + A * B * scaling) is learn
+        # - thus the input gradients DX should be simply
+        #   DX = DY * (W + A * B * scaling)^T
+        #      = DY * W^T + DY * B^T * A^T * scaling
         d_expanded_input = ops.scatter2scatter_lora(
-            X=grouped_grad_out, x_grouped=True,
-            W=expert_weights.permute(0, 2, 1),
-            A=expert_lora_B.permute(0,1,2),
-            B=expert_lora_A.permute(0,1,2),
+            X=grouped_grad_out, x_grouped=True, # DY
+            W=expert_weights.permute(0, 2, 1), # W^T
+            A=expert_lora_B.permute(0, 2, 1), # B^T
+            B=expert_lora_A.permute(0, 2, 1), # A^T
             scaling=(lora_alp/lora_r),
             padded_block_idxs=padded_block_idxs,
             sorted_expert_idxs=sorted_expert_idxs,
             sorted_scattered_idxs=sorted_scattered_idxs,
-            k=1,
+            k=1, # process it as no-fan out and handle below
             y_grouped=grouped_in,
             out=d_expanded_input # Reuse grouped_x buffer
         )
 
+        # handle the fan out
         if k == 1:
             d_input = d_expanded_input
         else:
             d_input = d_expanded_input.view(x.size(0), k, d_expanded_input.size(-1)).sum(-2)
-        # print("backward end.")
+
         return (
             # x, expert_weights,
             d_input, None, 
-            # expert_lora_A, expert_lora_B, expert_lora_scaling,
+            # expert_lora_A, expert_lora_B, 
             d_weights_A, d_weights_B, None,
-            # expert_lora_scaling, k
-            None, None,
+            # lora_r, lora_alp, k
+            None, None, None,
             # sorted_expert_idxs, sorted_scattered_idxs,
             None, None,
             # padded_block_idxs, expert_offsets,
@@ -128,7 +145,7 @@ class ParallelLinearLora(torch.autograd.Function):
             d_gates, None, None
         )
 
-def parallel_linear(inputs, expert_weights, k,
+def parallel_linear_lora(inputs, expert_weights, k,
                     sorted_expert_idxs, sorted_scattered_idxs,
                     padded_block_idxs, expert_offsets,
                     gates=None, grouped_in=False, grouped_out=False):

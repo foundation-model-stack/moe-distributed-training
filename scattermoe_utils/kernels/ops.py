@@ -36,44 +36,50 @@ def _scatter2scatter_lora(
 ):
     pid = tl.program_id(axis=0)
 
-    # The grid is assumed to be num_experts * N_BLOCK_COUNT. The input tokens are
+    # The grid is assumed to be num_padded_blocks * N_BLOCK_COUNT. The input tokens are
     # on the M dimension, that is blocked. The first task is to identify which expert
     # is being worked on by the kernel instance.
-    # - block_start_idx_ptr contains offesets into blocks of M. 
-    # - find E_idx to extract out the start index. 
+    # - block_start_idx_ptr contains offsets that allow the processing to occur in M Blocks
+    # - one padded block could contain multiple experts, in which case block_start_idx_ptr
+    #   will index multiple times into a single BLOCK_M.
+    # - e.g., block_start_idx_ptr = [0, 128, 256, 300, 428]
+    #   * there are 300 E_idx = 0 tokens, this requires 3 * 128 blocks to process, at 
+    #     offsets 0, 128, 256.
+    #   * the remaining are E_idx = 1 tokens, where the first 128 block starts at 300,
+    #     then goes on to 428, etc.
     # - use start index to instantiate the M_block
     # - M_block indices the X's worked on by this kernel instance
     N_BLOCK_COUNT = tl.cdiv(N, BLOCK_N)
-    E_idx = pid // N_BLOCK_COUNT
+    PB_idx = pid // N_BLOCK_COUNT # padded block index
     N_block_id = pid % N_BLOCK_COUNT
     M_range = tl.arange(0, BLOCK_M)
-    block_start_idx = tl.load(block_start_idx_ptr + E_idx)
+    block_start_idx = tl.load(block_start_idx_ptr + PB_idx) # M block starts from here
     M_block = tl.max_contiguous(block_start_idx + M_range, BLOCK_M)
 
     # Assumption: expert_idxs_ptr is a sorted list of expert ids.
     # - load expert_idxs_ptr into E_idxs
     # - construct the E_mask so we operate only on expert for this kernel instance (e.g., E_idx)
+    # - in cases where the M_block may overlap multiple experts, then tl.min(E_idxs) or 
+    #   E_idxs[0] (if it is sorted) can be used to infer the expert being worked on
     E_idxs = tl.load(expert_idxs_ptr + M_block, mask=M_block < (FAN_OUT * M), other=E)
-    # NOTE: this was in the original code, but do not think it is needed. 
-    # - the M_block is offset by block_start_idx
-    # E_idx = tl.min(E_idxs)
+    E_idx = tl.min(E_idxs) # if we do this we do not need to index the tensor
     E_mask = E_idxs == E_idx
 
     # Assumption: grouped_idx_ptr puts X in the order as expected by expert_idxs_ptr.
     # - same length as expert_idxs_ptr
-    # - this is used ONLY if grouping of X or Y (output) is required.
-    M_idx = tl.load(grouped_idx_ptr + M_block, mask=E_mask, other=0)
 
     # depending on grouped settings, set M_in_idx (input) and M_out_idx (output) appropriately
     # - if already grouped, then M_idx is not required and use M_block
     if x_grouped:
         M_in_idx = M_block
     else:
+        M_idx = tl.load(grouped_idx_ptr + M_block, mask=E_mask, other=0)
         M_in_idx = M_idx // FAN_OUT
 
     if y_grouped:
         M_out_idx = M_block
     else:
+        M_idx = tl.load(grouped_idx_ptr + M_block, mask=E_mask, other=0)
         M_out_idx = M_idx
 
     # - K_block for input dimension
@@ -382,6 +388,7 @@ def _groupXtY_lora(
             interm = tl.dot(dy, bt, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
             interm *= scaling
             acc_A += tl.dot(xt, interm, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
+            # acc_A = tl.dot(xt, dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
 
             # compute DB = A^t * X^t * DY * scaling
             interm = tl.dot(at, xt, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
