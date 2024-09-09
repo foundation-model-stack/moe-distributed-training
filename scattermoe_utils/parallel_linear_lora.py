@@ -17,7 +17,7 @@ class ParallelLinearLora(torch.autograd.Function):
 
         output = ops.scatter2scatter_lora(
             X=x, W=expert_weights, A=expert_lora_A, B=expert_lora_B,
-            scaling=(lora_alp / lora_r),
+            lora_alp=lora_alp,
             sorted_expert_idxs=sorted_expert_idxs,
             sorted_scattered_idxs=sorted_scattered_idxs,
             padded_block_idxs=padded_block_idxs,
@@ -100,8 +100,7 @@ class ParallelLinearLora(torch.autograd.Function):
             A=expert_lora_A, B=expert_lora_B,
             expert_offsets=expert_offsets,
             E=expert_weights.size(0),
-            lora_alp=lora_alp,
-            lora_r=lora_r,
+            scaling=(lora_alp / lora_r),
         )
 
         # NOTE: this maybe can be fused
@@ -115,7 +114,7 @@ class ParallelLinearLora(torch.autograd.Function):
             W=expert_weights.permute(0, 2, 1), # W^T
             A=expert_lora_B.permute(0, 2, 1), # B^T
             B=expert_lora_A.permute(0, 2, 1), # A^T
-            scaling=(lora_alp/lora_r),
+            lora_alp=lora_alp,
             padded_block_idxs=padded_block_idxs,
             sorted_expert_idxs=sorted_expert_idxs,
             sorted_scattered_idxs=sorted_scattered_idxs,
@@ -145,12 +144,20 @@ class ParallelLinearLora(torch.autograd.Function):
             d_gates, None, None
         )
 
-def parallel_linear_lora(inputs, expert_weights, k,
-                    sorted_expert_idxs, sorted_scattered_idxs,
-                    padded_block_idxs, expert_offsets,
-                    gates=None, grouped_in=False, grouped_out=False):
-    results = ParallelLinearLora.apply(inputs, expert_weights, k,
-                                   sorted_expert_idxs, sorted_scattered_idxs,
-                                   padded_block_idxs, expert_offsets, gates,
-                                   grouped_in, grouped_out)
+def parallel_linear_lora(
+    inputs, 
+    expert_weights, expert_lora_A, expert_lora_B, 
+    lora_r, lora_alp, k,
+    sorted_expert_idxs, sorted_scattered_idxs,
+    padded_block_idxs, expert_offsets,
+    gates=None, grouped_in=False, grouped_out=False
+):
+    results = ParallelLinearLora.apply(
+        inputs, expert_weights, 
+        expert_lora_A, expert_lora_B, 
+        lora_r, lora_alp, k,
+        sorted_expert_idxs, sorted_scattered_idxs,
+        padded_block_idxs, expert_offsets, gates,
+        grouped_in, grouped_out
+    )
     return results
