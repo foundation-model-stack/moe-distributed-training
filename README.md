@@ -88,6 +88,13 @@ torchrun --nproc_per_node=8 \
 	--learning_rate 5e-5
 ```
 
+### Running Tests
+
+Make sure to set the path:
+```
+PYTHONPATH=. pytest tests
+```
+
 
 ## Implementation Discussion
 
