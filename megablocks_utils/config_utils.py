@@ -6,6 +6,7 @@ from megablocks.layers.dmlp_registry import _REGISTRY
 
 # from megablocks.layers import mlp
 from .sparse_mlp2 import SparseMLPv2
+from .peft_utils import ParallelDroplessMLP as LoRAParallelDroplessMLP
 from megablocks.layers.moe import ParallelMLP
 from megablocks.layers.dmoe import ParallelDroplessMLP
 from megablocks.layers.mlp import resolve_dtensor
@@ -16,8 +17,50 @@ import torch.nn.functional as F
 
 # if is_scattermoe_available():
 import scattermoe
-from scattermoe.parallel_experts import parallel_linear as scattered_experts
+from scattermoe.parallel_experts import parallel_linear
+from scattermoe_utils.parallel_linear_lora import parallel_linear_lora
 from functools import partial
+
+# from peft.tuners.lora import LoraLayer
+# def is_lora_linear(mod: torch.nn.Module):
+#     return isinstance(mod, LoraLayer)
+
+def get_mlp_weights(mod: torch.nn.Module, name: str = "w1"):
+
+    weight = getattr(mod.mlp, name)
+    weight = weight.view(-1, mod.ffn_hidden_size, mod.hidden_size)
+    weight = weight.to_local() # because its sharded
+    if name in {"w1", "w3"}:
+        weight = weight.permute(0, 2, 1)
+    return (weight,)
+
+def get_mlp_weights_lora(mod: torch.nn.Module, name: str = "w1"):
+    # - inside, mod.mlp will resolve to mod.base_layer.mlp
+    W, = get_mlp_weights(mod, name)
+
+    (
+        A, B, r, lora_alp, 
+        hidden_size, ffn_hidden_size
+    ) = mod._lora_pointers[name]
+
+    # Assume LORA has no bias (should be correct because)
+    # these should be updated with no bias in LoraLayer.update_layer
+    # A = getattr(mod.lora_A, name).weight
+    A = A.view(-1, hidden_size, r)
+    # B = getattr(mod.lora_B, name).weight
+    B = B.view(-1, ffn_hidden_size, r).permute(0, 2, 1)
+
+    if name  == "w2":
+        A = A.permute(0, 2, 1)
+        B = B.permute(0, 2, 1)
+        temp = A # swap
+        A = B
+        B = temp
+
+    # r = mod.r[name]
+    # lora_alp = mod.lora_alpha[name]
+
+    return (W, A, B, r, lora_alp)
 
 def update_mlp_registry():
     # patch the registry to point to our v2
@@ -64,11 +107,19 @@ def update_mlp_registry():
                 bin_ids, mpu.experts_per_rank(self.args)
             )
 
+        if hasattr(self, "_lora_pointers"):
+            scattered_experts = parallel_linear_lora
+            get_weights = get_mlp_weights_lora
+        else:
+            scattered_experts = parallel_linear
+            get_weights = get_mlp_weights
+
         hidden_states = scattered_experts(
             x,
-            self.mlp.w1.view(
-                -1, self.ffn_hidden_size, self.hidden_size
-            ).to_local().permute(0, 2, 1),
+            # self.mlp.w1.view(
+            #     -1, self.ffn_hidden_size, self.hidden_size
+            # ).to_local().permute(0, 2, 1),
+            *get_weights(self, "w1"),
             1,
             bin_ids, # sorted_expert_idxs,
             indices, # sorted_scattered_idxs,
@@ -80,9 +131,10 @@ def update_mlp_registry():
         )
         hidden_states2 = scattered_experts(
             x,
-            self.mlp.w3.view(
-                -1, self.ffn_hidden_size, self.hidden_size
-            ).to_local().permute(0, 2, 1),
+            # self.mlp.w3.view(
+            #     -1, self.ffn_hidden_size, self.hidden_size
+            # ).to_local().permute(0, 2, 1),
+            *get_weights(self, "w3"),
             1,
             bin_ids, # sorted_expert_idxs,
             indices, # sorted_scattered_idxs,
@@ -95,9 +147,10 @@ def update_mlp_registry():
         hidden_states = F.silu(hidden_states) * hidden_states2
         return scattered_experts(
             hidden_states,
-            self.mlp.w2.view(
-                -1, self.ffn_hidden_size, self.hidden_size
-            ).to_local(),
+            # self.mlp.w2.view(
+            #     -1, self.ffn_hidden_size, self.hidden_size
+            # ).to_local(),
+            *get_weights(self, "w2"),
             1,
             bin_ids, # sorted_expert_idxs,
             indices, # sorted_scattered_idxs,
@@ -143,6 +196,7 @@ def update_mlp_registry():
     _REGISTRY['mlp']['scattermoe'] = SparseMLPv2
     
     ParallelDroplessMLP.permute_and_compute = permute_and_compute
+    # LoRAParallelDroplessMLP.permute_and_compute = permute_and_compute
 
     def forward_router(self, x):
         if self.training and self.args.moe_jitter_eps is not None:

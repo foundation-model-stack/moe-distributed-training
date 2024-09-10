@@ -60,7 +60,7 @@ def main(
     learning_rate: float = 1e-5,
     truncate_model_for_debug: bool = False,
     expert_degree: int = None,
-    use_lora: bool = False,
+    use_lora: str = "none", # attn-only #all
 ):
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -211,19 +211,68 @@ def main(
         )
         return m
 
-    if use_lora:
+    # no stringent value checks, please set carefully
+    if use_lora != "none":
+
+        # target modules set if use_lora == "all" or "attn-only"
+        if use_lora in {'all', 'attn-only'}:
+            tm = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        else:
+            tm = []
+
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=16,
             lora_alpha=16,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.0, # for now do not support dropout
+            bias="none",
+            target_modules=tm,
         )
+
+        if use_lora in {'all', 'mlp-only'}:
+            assert use_scattermoe, "lora adapters cannot be used on MLP without scattermoe"
+
+            from megablocks.layers.dmoe import ParallelDroplessMLP
+            from megablocks_utils.peft_utils import ParallelDroplessMLP as LoRAParallelDroplessMLP
+
+            # inject a custom module for MLP since SparseMLP is not 
+            # a supported class
+            # - FIXME: does not take care of sharding the lora adapters
+            #   so the training results is incorrect now
+            peft_config._register_custom_module({
+                ParallelDroplessMLP: LoRAParallelDroplessMLP
+            })
+            
+            # tm += ["up_proj", "down_proj", "gate_proj"]
+            # tm += ["experts"]
+            peft_config.target_modules.add("experts")
+
         model = prepare_peft(
             model, peft_config, 
             gradient_checkpointing=True,
             bf16=(load_model_dtype=='bfloat16'),
             autocast_adapter_dtype=False, # do not upcast because FSDP cannot handle mixed types
         )
+
+        # FIXME: its abit problemantic to use different adapter
+        # names
+        if use_lora in {'all', 'mlp-only'}:
+            # - after the PEFT prepare we have to force the parameters
+            # back to require_grad = True
+            # - lora has no bias
+           for name, p in model.named_parameters():
+               if "experts" in name and 'lora_' in name:
+                   # p.data = p.data.to(torch.float32)
+                   p.requires_grad = True
+
+        # if use_lora == 'all':
+        #     # we need to cast the expert loras
+        #     for name, p in model.named_parameters():
+        #         if "experts" in name and 'lora_' in name:
+        #             print (name)
+        #             p.data = p.data.to(torch.float32)
+
+        #     torch.distributed.breakpoint(0)
 
     # prepare the model without accelerate
     model = prepare_model(model)
@@ -298,14 +347,15 @@ def main(
                 tr_loss += loss.item() / gradient_accumulation_steps
 
                 if accelerator.sync_gradients:
-                    _grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                     try:
+                        _grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                         # if its a DTensor we need to do this
                         _grad_norm = _grad_norm.to_local()
+                        _grad_norm = _grad_norm.item()
                     except:
                         pass
+                        _grad_norm = 0.
 
-                    _grad_norm = _grad_norm.item()
 
                 if (
                     step > 0 and

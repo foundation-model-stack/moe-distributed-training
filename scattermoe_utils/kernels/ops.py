@@ -136,9 +136,10 @@ def _scatter2scatter_lora(
         # - accumulate adapter
         # - interim = X * A * scaling
         # - interm wil be of dimensions M_block by lora_r
-        interim = tl.dot(x, a, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
+        # interim = tl.dot(x, a, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
+        interim = tl.dot(x, a)
         interim *= scaling
-        acc += tl.dot(interim, b, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
+        acc += tl.dot(interim.to(b.dtype), b, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
 
         # move pointers in K
         # NOTE: b has no dependence on K, so it doesnt need to move
@@ -382,15 +383,14 @@ def _groupXtY_lora(
                 dy = tl.load(dy_blk_ptrs, mask=M_mask[:, None] & N_mask[None, :])
 
             # compute DA = X^t * DY * B^T * scaling
-            interm = tl.dot(dy, bt, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
+            interm = tl.dot(dy, bt)
             interm *= scaling
-            acc_A += tl.dot(xt, interm, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
-            # acc_A = tl.dot(xt, dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
+            acc_A += tl.dot(xt, interm.to(xt.dtype), out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
 
             # compute DB = A^t * X^t * DY * scaling
-            interm = tl.dot(at, xt, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
+            interm = tl.dot(at, xt)
             interm *= scaling
-            acc_B += tl.dot(interm, dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
+            acc_B += tl.dot(interm.to(dy.dtype), dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
 
             # - move pointers
             xt_blk_ptrs += BLOCK_M * stride_xm
