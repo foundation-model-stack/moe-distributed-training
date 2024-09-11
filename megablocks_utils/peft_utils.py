@@ -62,11 +62,6 @@ class ParallelDroplessMLP(torch.nn.Module, LoraLayer):
 
             B = getattr(self.lora_B, name)
 
-            # we need to upcast the adapter weights because
-            # it is otherwise problematic for the kernel
-            # A.weight.data = A.weight.data.to(torch.float32)
-            # B.weight.data = B.weight.data.to(torch.float32)
-
             r = self.r[name]
             alpha = self.lora_alpha[name]
             # put pointers in the base layer 

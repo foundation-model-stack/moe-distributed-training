@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
 from .kernels import ops
-import scattermoe.kernels as orig_kernels
+
+try:
+    import scattermoe.kernels as orig_kernels
+except ImportError:
+    pass
 
 # lora_scaling is lora_alpha / lora_r
 class ParallelLinearLora(torch.autograd.Function):

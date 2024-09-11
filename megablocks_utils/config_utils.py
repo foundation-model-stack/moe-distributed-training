@@ -15,15 +15,14 @@ from megablocks.layers import mpu
 import torch
 import torch.nn.functional as F
 
-# if is_scattermoe_available():
-import scattermoe
-from scattermoe.parallel_experts import parallel_linear
+try:
+    import scattermoe
+    from scattermoe.parallel_experts import parallel_linear
+except ImportError:
+    pass
+
 from scattermoe_utils.parallel_linear_lora import parallel_linear_lora
 from functools import partial
-
-# from peft.tuners.lora import LoraLayer
-# def is_lora_linear(mod: torch.nn.Module):
-#     return isinstance(mod, LoraLayer)
 
 def get_mlp_weights(mod: torch.nn.Module, name: str = "w1"):
 
@@ -35,7 +34,6 @@ def get_mlp_weights(mod: torch.nn.Module, name: str = "w1"):
     return (weight,)
 
 def get_mlp_weights_lora(mod: torch.nn.Module, name: str = "w1"):
-    # - inside, mod.mlp will resolve to mod.base_layer.mlp
     W, = get_mlp_weights(mod, name)
 
     (
@@ -47,7 +45,6 @@ def get_mlp_weights_lora(mod: torch.nn.Module, name: str = "w1"):
     # these should be updated with no bias in LoraLayer.update_layer
     # A = getattr(mod.lora_A, name).weight
     A = A.view(-1, hidden_size, r)
-    # B = getattr(mod.lora_B, name).weight
     B = B.view(-1, ffn_hidden_size, r).permute(0, 2, 1)
 
     if name  == "w2":
@@ -56,9 +53,6 @@ def get_mlp_weights_lora(mod: torch.nn.Module, name: str = "w1"):
         temp = A # swap
         A = B
         B = temp
-
-    # r = mod.r[name]
-    # lora_alp = mod.lora_alpha[name]
 
     return (W, A, B, r, lora_alp)
 
@@ -116,9 +110,6 @@ def update_mlp_registry():
 
         hidden_states = scattered_experts(
             x,
-            # self.mlp.w1.view(
-            #     -1, self.ffn_hidden_size, self.hidden_size
-            # ).to_local().permute(0, 2, 1),
             *get_weights(self, "w1"),
             1,
             bin_ids, # sorted_expert_idxs,
@@ -131,9 +122,6 @@ def update_mlp_registry():
         )
         hidden_states2 = scattered_experts(
             x,
-            # self.mlp.w3.view(
-            #     -1, self.ffn_hidden_size, self.hidden_size
-            # ).to_local().permute(0, 2, 1),
             *get_weights(self, "w3"),
             1,
             bin_ids, # sorted_expert_idxs,
@@ -147,9 +135,6 @@ def update_mlp_registry():
         hidden_states = F.silu(hidden_states) * hidden_states2
         return scattered_experts(
             hidden_states,
-            # self.mlp.w2.view(
-            #     -1, self.ffn_hidden_size, self.hidden_size
-            # ).to_local(),
             *get_weights(self, "w2"),
             1,
             bin_ids, # sorted_expert_idxs,
@@ -196,7 +181,6 @@ def update_mlp_registry():
     _REGISTRY['mlp']['scattermoe'] = SparseMLPv2
     
     ParallelDroplessMLP.permute_and_compute = permute_and_compute
-    # LoRAParallelDroplessMLP.permute_and_compute = permute_and_compute
 
     def forward_router(self, x):
         if self.training and self.args.moe_jitter_eps is not None:

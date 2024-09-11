@@ -118,6 +118,15 @@ def main(
         if expert_degree is None:
             expert_degree = world_size
 
+        if use_scattermoe:
+            try:
+                import scattermoe
+            except ImportError:
+                raise ValueError(
+                    "use_scattermoe=True but scattermoe not installed. "
+                    "pip install -r requirements-scattermoe.txt"
+                )
+
         device_mesh = shard_moe(
             model, 
             MixtralSparseMoeBlock, 
@@ -243,8 +252,6 @@ def main(
                 ParallelDroplessMLP: LoRAParallelDroplessMLP
             })
             
-            # tm += ["up_proj", "down_proj", "gate_proj"]
-            # tm += ["experts"]
             peft_config.target_modules.add("experts")
 
         model = prepare_peft(
@@ -264,15 +271,6 @@ def main(
                if "experts" in name and 'lora_' in name:
                    # p.data = p.data.to(torch.float32)
                    p.requires_grad = True
-
-        # if use_lora == 'all':
-        #     # we need to cast the expert loras
-        #     for name, p in model.named_parameters():
-        #         if "experts" in name and 'lora_' in name:
-        #             print (name)
-        #             p.data = p.data.to(torch.float32)
-
-        #     torch.distributed.breakpoint(0)
 
     # prepare the model without accelerate
     model = prepare_model(model)
@@ -353,7 +351,6 @@ def main(
                         _grad_norm = _grad_norm.to_local()
                         _grad_norm = _grad_norm.item()
                     except:
-                        pass
                         _grad_norm = 0.
 
 
