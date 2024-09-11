@@ -242,12 +242,13 @@ def main(
             assert use_scattermoe, "lora adapters cannot be used on MLP without scattermoe"
 
             from megablocks.layers.dmoe import ParallelDroplessMLP
-            from megablocks_utils.peft_utils import ParallelDroplessMLP as LoRAParallelDroplessMLP
+            from megablocks_utils.peft_utils import ParallelDroplessMLP as LoRAParallelDroplessMLP, ARTIFACTS
+
+            # inject this so we can replicate
+            ARTIFACTS['device_mesh'] = device_mesh
 
             # inject a custom module for MLP since SparseMLP is not 
             # a supported class
-            # - FIXME: does not take care of sharding the lora adapters
-            #   so the training results is incorrect now
             peft_config._register_custom_module({
                 ParallelDroplessMLP: LoRAParallelDroplessMLP
             })
@@ -269,7 +270,6 @@ def main(
             # - lora has no bias
            for name, p in model.named_parameters():
                if "experts" in name and 'lora_' in name:
-                   # p.data = p.data.to(torch.float32)
                    p.requires_grad = True
 
     # prepare the model without accelerate

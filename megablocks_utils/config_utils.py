@@ -54,6 +54,9 @@ def get_mlp_weights_lora(mod: torch.nn.Module, name: str = "w1"):
         A = B
         B = temp
 
+    A = resolve_dtensor(A)
+    B = resolve_dtensor(B)
+
     return (W, A, B, r, lora_alp)
 
 def update_mlp_registry():

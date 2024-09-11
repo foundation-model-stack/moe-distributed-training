@@ -136,7 +136,6 @@ def _scatter2scatter_lora(
         # - accumulate adapter
         # - interim = X * A * scaling
         # - interm wil be of dimensions M_block by lora_r
-        # interim = tl.dot(x, a, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)
         interim = tl.dot(x, a)
         interim *= scaling
         acc += tl.dot(interim.to(b.dtype), b, allow_tf32=allow_tf32, out_dtype=ACC_TYPE)

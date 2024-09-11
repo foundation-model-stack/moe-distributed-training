@@ -1,11 +1,12 @@
 
 import torch
 from peft.tuners.lora import LoraLayer
-# from megablocks.layers.moe import ParallelMLP
-# from megablocks.layers.dmoe import ParallelDroplessMLP
-# from megablocks.layers.arguments import Arguments
+from torch.distributed._tensor import Placement, Replicate, Shard, distribute_tensor
 from megablocks.layers import mpu
 from typing import Union, Any
+
+# for injection
+ARTIFACTS = {}
 
 # this is the lora version
 # class ParallelDroplessMLP(ParallelMLP, LoraLayer):
@@ -39,6 +40,14 @@ class ParallelDroplessMLP(torch.nn.Module, LoraLayer):
         # dummy not really used
         self._active_adapter = adapter_name
 
+        device_mesh = ARTIFACTS.get('device_mesh')
+        if device_mesh is not None:
+            # for A and B, of size ff_dim x hidd
+            placements = (
+                [Shard(0)] + 
+                [Replicate() for _ in range(device_mesh.ndim-1)]
+            )
+
         base_layer._lora_pointers = {}
 
         # assume that all the parameters of ParallelMLP.mlp 
@@ -58,12 +67,63 @@ class ParallelDroplessMLP(torch.nn.Module, LoraLayer):
             # need to adjust the A
             # - ()
             A = getattr(self.lora_A, name)
-            A.weight.data = A.weight.data.T # HACK
+            if device_mesh is None:
+                A.weight.data = A.weight.data.T # HACK
+            else:
+                weight = A.weight.data.T
+
+                # must cast here otherwise, the casting on the 
+                # Dtensor will not affect the local
+                if self.args.bf16 or self.args.fp16:
+                    weight = weight.to(
+                        torch.bfloat16 if self.args.bf16
+                        else torch.float16
+                    )
+
+                # - NOTE: if we do it this way, all reps
+                # will begin with the same initialization of A
+                # - it is ok for random, but not ok for other
+                # - types of intialization
+                delattr(A, 'weight')
+                setattr(
+                    A, 'weight', 
+                    torch.nn.Parameter(
+                        distribute_tensor(
+                            weight.repeat(num_experts, 1), 
+                            device_mesh,
+                            placements
+                        ),
+                        requires_grad=True
+                    )
+                )
 
             B = getattr(self.lora_B, name)
+            if device_mesh is not None:
+                weight = B.weight.data
+
+                # cast (see above)
+                if self.args.bf16 or self.args.fp16:
+                    weight = weight.to(
+                        torch.bfloat16 if self.args.bf16
+                        else torch.float16
+                    )
+
+                delattr(B, 'weight')
+                setattr(
+                    B, 'weight', 
+                    torch.nn.Parameter(
+                        distribute_tensor(
+                            weight.repeat(num_experts, 1), 
+                            device_mesh,
+                            placements
+                        ),
+                        requires_grad=True
+                    )
+                )
 
             r = self.r[name]
             alpha = self.lora_alpha[name]
+
             # put pointers in the base layer 
             base_layer._lora_pointers[
                 name
