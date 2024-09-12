@@ -113,6 +113,12 @@ def main(
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
 
+    if use_scattermoe and not use_megablocks_sharding:
+        raise ValueError(
+            "use_scatter_moe==True only works if performing "
+            "megablocks sharding."
+        )
+
     if use_megablocks_sharding:
 
         if expert_degree is None:
@@ -174,7 +180,7 @@ def main(
     # - we cannot use accelerate's prepare model because there is no 
     #   FSDP2 integration yet
     def prepare_model(m: torch.nn.Module):
-        if not use_lora:
+        if use_lora == "none":
             layers = m.model.layers
         else:
             layers = m.get_base_model().model.layers
@@ -229,6 +235,14 @@ def main(
         else:
             tm = []
 
+        # if we are not doing megablocks sharding
+        if (
+            not use_megablocks_sharding and  
+            use_lora in {"all", "mlp-only"} # if need adapters
+        ):
+            # add these extra here 
+            tm += ["up_proj", "down_proj", "gate_proj"]
+
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=16,
@@ -238,7 +252,9 @@ def main(
             target_modules=tm,
         )
 
-        if use_lora in {'all', 'mlp-only'}:
+        if (
+            use_megablocks_sharding and use_lora in {'all', 'mlp-only'}
+        ):
             assert use_scattermoe, "lora adapters cannot be used on MLP without scattermoe"
 
             from megablocks.layers.dmoe import ParallelDroplessMLP
@@ -263,8 +279,8 @@ def main(
         )
 
         # FIXME: its abit problemantic to use different adapter
-        # names
-        if use_lora in {'all', 'mlp-only'}:
+        # names, so we do this manually
+        if use_scattermoe and use_lora in {'all', 'mlp-only'}:
             # - after the PEFT prepare we have to force the parameters
             # back to require_grad = True
             # - lora has no bias
