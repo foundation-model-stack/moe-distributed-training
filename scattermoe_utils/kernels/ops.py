@@ -8,6 +8,10 @@ BLOCK_M = 128
 def _scatter2scatter_configs():
     return [
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 64, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128}, num_stages=1, num_warps=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=2, num_warps=4),
     ]
 
 @triton.autotune(configs=_scatter2scatter_configs(), key=['M', 'N', 'K'], )
