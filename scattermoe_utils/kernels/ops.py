@@ -8,10 +8,6 @@ BLOCK_M = 128
 def _scatter2scatter_configs():
     return [
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 64, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128}, num_stages=1, num_warps=4),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=2, num_warps=4),
     ]
 
 @triton.autotune(configs=_scatter2scatter_configs(), key=['M', 'N', 'K'], )
@@ -217,9 +213,227 @@ def scatter2scatter_lora(
 
 
 def _config_XtY():
+    #return [
+    #    triton.Config(
+    #        {
+    #            'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32, 
+    #            'GROUP_K': 4, 'GROUP_M': 4,
+    #        }, 
+    #        num_stages=4, num_warps=4
+    #    ),
+    #    triton.Config(
+    #        {
+    #            'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128, 
+    #            'GROUP_K': 4, 'GROUP_M': 4,
+    #        }, 
+    #        num_stages=1, num_warps=4
+    #    ),
+    #]
     return [
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32}, num_stages=4, num_warps=4),
+        triton.Config(
+            {
+                'BLOCK_N': 16, 'BLOCK_K': 16, 'BLOCK_M': 16, 
+                'GROUP_K': 2, 'GROUP_M': 1,
+            }, 
+            num_stages=1, num_warps=1
+        ),
     ]
+
+# this is our v2 version
+def group_bwd_W_v2(DY, X, expert_offsets, E, G=1):
+    def grid(META):
+        grid = (
+            triton.cdiv(META['K'], META['BLOCK_K']),
+            triton.cdiv(META['N'], META['BLOCK_N']),
+            triton.cdiv(META['M'], META['BLOCK_M'] * META['GROUP_M']),
+        )
+        return grid
+
+    # - need to ensure that stuff is properly zeroed since
+    #   there is no zeroing inside the kernel
+    DWt = torch.zeros((E, DY.size(-1), X.size(-1)), device=DY.device, dtype=DY.dtype)
+    DW = DWt.permute(0, 2, 1)
+    # lock = torch.zeros(E, 128, 128, dtype=torch.int32, device=DY.device)
+    # count = torch.zeros(E, 128, 128, dtype=torch.int32, device=DY.device)
+
+    # - we have G groups per expert
+    # - these will be assigned on (K,N,M)
+    Lock = torch.zeros(E * G, dtype=torch.int32, device=DY.device)
+    
+    with torch.cuda.device(DY.device):
+        _groupXtY_v2[grid](
+            # DY_ptr, stride_dym, stride_dyk,
+            DY, DY.stride(0), DY.stride(1),
+            # X_ptr, stride_xm, stride_xn,
+            X, X.stride(0), X.stride(1),
+            # DW_ptr, stride_dwe, stride_dwk, stride_dwn,
+            DW, DW.stride(0), DW.stride(1), DW.stride(2),
+            # expert_offsets_ptr,
+            expert_offsets, Lock,
+            # K: tl.constexpr, N: tl.constexpr,
+            M=DY.size(0), N=DY.size(-1), K=X.size(-1), E=E,
+            GROUP_E=G,
+            # ACC_TYPE: tl.constexpr,
+            ACC_TYPE=tl.float32,
+            allow_tf32=True
+        )
+        return DW
+
+
+# use locking across programs
+# - https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
+@triton.autotune(configs=_config_XtY(), key=['M', 'N', 'K'], )
+@triton.heuristics({
+    "NO_K_MASK": lambda args: (args['K'] % args['BLOCK_K']) == 0,
+    "NO_N_MASK": lambda args: (args['N'] % args['BLOCK_N']) == 0,
+})
+@triton.jit
+def _groupXtY_v2(
+    DY_ptr, stride_dym, stride_dyk,
+    X_ptr, stride_xm, stride_xn,
+    DW_ptr, stride_dwe, stride_dwk, stride_dwn,
+    expert_offsets_ptr,
+    Lock, 
+    M, K: tl.constexpr, N: tl.constexpr, E: tl.constexpr, 
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_K: tl.constexpr, GROUP_M: tl.constexpr, GROUP_E: tl.constexpr,
+    ACC_TYPE: tl.constexpr,
+    allow_tf32: tl.constexpr,
+    NO_K_MASK: tl.constexpr, NO_N_MASK: tl.constexpr,
+):
+    # first dimension is the index into K block
+    # second dimension is the index into N block 
+    # third dimension is the group index on M (inputs)
+    pid0 = tl.program_id(axis=0)
+    pid1 = tl.program_id(axis=1)
+    pid2 = tl.program_id(axis=2)
+    num0 = tl.num_programs(0)
+    num1 = tl.num_programs(1)
+
+    # NOTE: is this really needed?
+    pid0, pid1 = tl.swizzle2d(pid0, pid1, num0, num1, GROUP_K)
+
+    # - K blocks
+    K_block_id = pid0
+    N_block_id = pid1
+    M_group_id = pid2
+
+    # find the starting point
+    start_idx = M_group_id * BLOCK_M * GROUP_M
+    E_idx = 0
+    end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
+    # - if offset == M_start => ends at offset-1, so exclude
+    while E_idx < E and end_idx <= start_idx:
+        E_idx += 1
+        expert_offsets_ptr += 1
+
+        if E_idx < E:
+            # - guard against illegal access
+            end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
+
+    # - each program processes GROUP_M of M_blocks together
+    # - last index of this M block
+    M_block_end = (M_group_id + 1) * BLOCK_M * GROUP_M
+
+    # - K and N block tiling
+    K_block = K_block_id * BLOCK_K + tl.arange(0, BLOCK_K)
+    K_mask = K_block < K
+    K_block = tl.max_contiguous(tl.multiple_of(K_block % K, BLOCK_K), BLOCK_K)
+
+    N_block = N_block_id * BLOCK_N + tl.arange(0, BLOCK_N)
+    N_mask = N_block < N
+    N_block = tl.max_contiguous(tl.multiple_of(N_block % N, BLOCK_N), BLOCK_N)
+
+    # - Locks
+    # - locks = torch.zeros(E, K_BLOCKS, N_BLOCKS, dtype=torch.int32, device=w.device)
+    # Lock += E_idx + K_block_id * num0 + N_block_id * num1
+    # Count += E_idx + K_block_id * num0 + N_block_id * num1
+
+    # - this behaves like a hash function
+    grp_id = (pid0 * num0 + pid1 * num1 + M_group_id * GROUP_M) % GROUP_E
+    grp_size = E * GROUP_E
+    Lock += E_idx * grp_size + grp_id
+    # Count += grp_size
+
+    # - the invariant:
+    # - start_idx < M_block_end
+    # - process tiles (K, N) tiles, accmulating within GROUP_M 
+    #   iterations of the inner loop
+
+    while E_idx < E and start_idx < M_block_end:
+
+        # - guarded against illegal access
+        end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
+
+        # - M tiling
+        # - M_block set to start from start_idx
+        M_block = tl.max_contiguous(start_idx + tl.arange(0, BLOCK_M), BLOCK_M)
+
+        xt_blk_ptrs = X_ptr + K_block[:, None] * stride_xn + M_block[None, :] * stride_xm
+        dy_blk_ptrs = DY_ptr + M_block[:, None] * stride_dym + N_block[None, :] * stride_dyk
+
+        # - for output for expert E_idx
+        DW_blk_ptrs = DW_ptr + E_idx * stride_dwe + K_block[:, None] * stride_dwk + N_block[None, :] * stride_dwn
+
+        # - process for a current expert that runs between 
+        #   start_idx and min(end_idx, M_block_end)
+        # - if the expert runs over M_block_end, then it will be processed
+        #   by the next program
+        acc = tl.zeros((BLOCK_K, BLOCK_N), dtype=ACC_TYPE)
+
+        # - this is the end_idx that takes into account the M_block_end
+        end_idx2 = tl.minimum(end_idx, M_block_end)
+        iters = tl.cdiv(end_idx2 - start_idx, BLOCK_M)
+        for i in range(0, iters):
+            M_mask = (i * BLOCK_M + M_block) < end_idx2
+            if NO_K_MASK:
+                xt = tl.load(xt_blk_ptrs, mask=M_mask[None, :])
+            else:
+                xt = tl.load(xt_blk_ptrs, mask=K_mask[:, None] & M_mask[None, :])
+            if NO_N_MASK:
+                dy = tl.load(dy_blk_ptrs, mask=M_mask[:, None])
+            else:
+                dy = tl.load(dy_blk_ptrs, mask=M_mask[:, None] & N_mask[None, :])
+
+            xt_blk_ptrs += BLOCK_M * stride_xm
+            dy_blk_ptrs += BLOCK_M * stride_dym
+            acc += tl.dot(xt, dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
+
+        # M_Block is done, try to grab the lock
+        while tl.atomic_cas(Lock, 0, 1) == 1:
+            print ("Lock", Lock)
+            pass
+
+        # this is a signal to see if its the first accum in the (K, N) tile
+        # count = tl.load(Count)
+
+        # if count == 0:
+        #     # set the signal so that we will accumulate from now on
+        #     tl.atomic_xchg(Count, 1)
+        # else:
+        #     acc += tl.load(DW_blk_ptrs, mask=mask)
+
+        partial = tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
+        acc += partial
+
+        # store
+        acc = acc.to(DW_blk_ptrs.dtype.element_ty)
+        tl.store(DW_blk_ptrs, acc, mask=K_mask[:, None] & N_mask[None, :])
+
+        # release Lock
+        tl.atomic_xchg(Lock, 0)
+
+        # this will be the new start index
+        start_idx = tl.load(expert_offsets_ptr).to(tl.int32)
+
+        # increment
+        E_idx += 1
+        Lock += grp_size
+        # Count += grp_size
+
+        # - may go out of bounds
+        expert_offsets_ptr += 1
+
 
 def group_bwd_AB(DY, X, A, B, scaling, expert_offsets, E):
 
