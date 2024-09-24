@@ -217,14 +217,14 @@ def _config_XtY():
         triton.Config(
             {
                 'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32, 
-                'GROUP_K': 4, 'GROUP_M': 128,
+                'GROUP_K': 4, 'CHUNK_M': 128,
             }, 
             num_stages=4, num_warps=4
         ),
         triton.Config(
             {
                 'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128, 
-                'GROUP_K': 4, 'GROUP_M': 128,
+                'GROUP_K': 4, 'CHUNK_M': 128,
             }, 
             num_stages=1, num_warps=4
         ),
@@ -233,28 +233,43 @@ def _config_XtY():
     #     triton.Config(
     #         {
     #             'BLOCK_N': 16, 'BLOCK_K': 16, 'BLOCK_M': 16, 
-    #             'GROUP_K': 2, 'GROUP_M': 2,
+    #             'GROUP_K': 2, 'CHUNK_M': 2,
     #         }, 
     #         num_stages=1, num_warps=1
     #     ),
     # ]
 
-# this is our v2 version
+# this is version2 that chunks the sequence (M) dimension into groups.
+# - the M dimension will get chunked to scale as M increases.
+# - each chunk will take CHUNK_M number of BLOCK_M.
+# - each accumulate will be performed in G groups. Each chunk gets assigned to one of the groups from 0..G-1.
+#   They compute in parallel.
+# - If two chunks get assigned to one of the groups, then they compute in series. They is a locking mechanism. Each
+#   group in G consumes addiitional memory due to an extra buffer for the accum. The buffers are reduced at the 
+#   end of the compute.
+# - A single chunk may process more than one expert if the chunk covers sequences that involve
+#   multiple experts. This may more so happen when BLOCK_M * CHUNK_M is large
+# - Similarly, the (K, N) tiles are independent of each other, but we also hash them in buckets. This is controlled
+#   by P. Unlike G, having a large P incurs minimum additional memory (only E * G lock entries).
 def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
+
+    # - gridded by (K, N) tile and a BLOCK_M * CHUNK_M chunk in the inner dimension
     def grid(META):
         grid = (
             triton.cdiv(META['K'], META['BLOCK_K']),
             triton.cdiv(META['N'], META['BLOCK_N']),
-            triton.cdiv(META['M'], META['BLOCK_M'] * META['GROUP_M']),
+            triton.cdiv(META['M'], META['BLOCK_M'] * META['CHUNK_M']),
         )
         return grid
 
     # - need to ensure that stuff is properly zeroed since
-    #   there is no zeroing inside the kernel
+    #   there is no zeroing inside the kernel.
+    # - allow G groups for each of the E experts
     DW = torch.zeros((E, G, X.size(-1), DY.size(-1)), device=DY.device, dtype=DY.dtype)
 
-    # - we have G groups per expert
-    # - these will be assigned on (K,N,M)
+    # Locks
+    # - we require P series of locks, one each for the tiles (K,N)
+    # - then of the P's will have E * G locks, for the experts X CHUNK_M
     Lock = torch.zeros(P * E * G, dtype=torch.int32, device=DY.device)
     
     with torch.cuda.device(DY.device):
@@ -263,24 +278,24 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
             DY, DY.stride(0), DY.stride(1),
             # X_ptr, stride_xm, stride_xn,
             X, X.stride(0), X.stride(1),
-            # DW_ptr, stride_dwg, stride_dwe, stride_dwk, stride_dwn,
+            # DW_ptr, stride_dwe, stride_dwg, stride_dwk, stride_dwn,
             DW, DW.stride(0), DW.stride(1), DW.stride(2), DW.stride(3),
             # expert_offsets_ptr,
             expert_offsets, Lock,
             # K: tl.constexpr, N: tl.constexpr,
             M=DY.size(0), N=DY.size(-1), K=X.size(-1), E=E,
-            GROUP_E=G, P=P,
+            G=G, P=P,
             # ACC_TYPE: tl.constexpr,
             ACC_TYPE=tl.float32,
             allow_tf32=True
         )
+        # - need to investigate if this needs to be replaced with a kernel or not
         return DW.sum(1) # reduce over groups
-        # return DW
 
 
 # use locking across programs
 # - https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
-@triton.autotune(configs=_config_XtY(), key=['M', 'N', 'K'], )
+@triton.autotune(configs=_config_XtY(), key=['N', 'K'], )
 @triton.heuristics({
     "NO_K_MASK": lambda args: (args['K'] % args['BLOCK_K']) == 0,
     "NO_N_MASK": lambda args: (args['N'] % args['BLOCK_N']) == 0,
@@ -294,14 +309,17 @@ def _groupXtY_v2(
     Lock, 
     M, K: tl.constexpr, N: tl.constexpr, E: tl.constexpr, 
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_K: tl.constexpr, GROUP_M: tl.constexpr, GROUP_E: tl.constexpr,
-    P: tl.constexpr,
+    GROUP_K: tl.constexpr, # for swizzling
+    CHUNK_M: tl.constexpr, # number of BLOCK_M's used to form a chunk
+    G: tl.constexpr, # number of chunks computed in parallel
+    P: tl.constexpr, # number of tiles computed in parallel
     ACC_TYPE: tl.constexpr,
     allow_tf32: tl.constexpr,
     NO_K_MASK: tl.constexpr, NO_N_MASK: tl.constexpr,
 ):
-    # first dimension is the index into K block
-    # second dimension is the index into N block 
+
+    # first dimension is the tile index into K (input dim)
+    # second dimension is the tile index into N (output dim)
     # third dimension is the group index on M (inputs)
     pid0 = tl.program_id(axis=0)
     pid1 = tl.program_id(axis=1)
@@ -309,19 +327,22 @@ def _groupXtY_v2(
     num0 = tl.num_programs(0)
     num1 = tl.num_programs(1)
 
-    # NOTE: is this really needed?
+    # - swizzle it up to improve cache usage
     pid0, pid1 = tl.swizzle2d(pid0, pid1, num0, num1, GROUP_K)
 
-    # - K blocks
+    # - rename the pids into something more readable
     K_block_id = pid0
     N_block_id = pid1
-    M_group_id = pid2
+    M_chunk_id = pid2
 
-    # find the starting point
-    start_idx = M_group_id * BLOCK_M * GROUP_M
+    # find the starting point of the M chunk
+    start_idx = M_chunk_id * BLOCK_M * CHUNK_M
+
+    # - find the expert that corresponds involved in the sequence starting
+    #   at start_idx
+    # - if offset == M_start => ends at offset-1, so exclude
     E_idx = 0
     end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
-    # - if offset == M_start => ends at offset-1, so exclude
     while E_idx < E and end_idx <= start_idx:
         E_idx += 1
         expert_offsets_ptr += 1
@@ -330,11 +351,11 @@ def _groupXtY_v2(
             # - guard against illegal access
             end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
 
-    # - each program processes GROUP_M of M_blocks together
-    # - last index of this M block
-    M_block_end = (M_group_id + 1) * BLOCK_M * GROUP_M
+    # - each program will stop at the end of the M chunk
+    # - this may cover multiple experts depending on values in expert_offsets_ptr
+    M_block_end = (M_chunk_id + 1) * BLOCK_M * CHUNK_M
 
-    # - K and N block tiling
+    # - K and N tile ranges for the current program
     K_block = K_block_id * BLOCK_K + tl.arange(0, BLOCK_K)
     K_mask = K_block < K
     K_block = tl.max_contiguous(tl.multiple_of(K_block % K, BLOCK_K), BLOCK_K)
@@ -343,33 +364,31 @@ def _groupXtY_v2(
     N_mask = N_block < N
     N_block = tl.max_contiguous(tl.multiple_of(N_block % N, BLOCK_N), BLOCK_N)
 
-    # - Locks
-    # - locks = torch.zeros(E, K_BLOCKS, N_BLOCKS, dtype=torch.int32, device=w.device)
-    # Lock += E_idx + K_block_id * num0 + N_block_id * num1
-    # Count += E_idx + K_block_id * num0 + N_block_id * num1
+    # - use primes to distribute to bin the tile
+    # - TODO: replace with larger primes
+    tile_bin = (K_block_id * 11 + N_block_id * 13) % P
 
-    grp_size = GROUP_E
+    # - get the E * G locks corresponding to the tile bin
+    Lock += tile_bin * E * G
 
-    # - also another hash
-    p_bin = (pid0 * 11 + pid1 * 13) % P
-    Lock += p_bin * E * grp_size
+    # - get the group id for the chunk (within the expert E_idx)
+    grp_id = M_chunk_id % G
 
-    # - this behaves like a hash function
-    # grp_id = (pid0 * num0 + pid1 * num1 + M_group_id * GROUP_M) % GROUP_E
-    grp_id = M_group_id % GROUP_E
+    # - get the lock 
+    Lock += E_idx * G + grp_id
 
-    # grp_size = E * GROUP_E
-    Lock += E_idx * grp_size + grp_id
-    # Count += grp_size
-
-    # - the invariant:
-    # - start_idx < M_block_end
-    # - process tiles (K, N) tiles, accmulating within GROUP_M 
-    #   iterations of the inner loop
-
+    # - the invariant for the inner loop iterations in the chunk that may take place 
+    #   across muliple experts (start_idx < M_block_end)
+    # - process tiles (K, N) tiles of size BLOCK_M. Process a total of CHUNK_M such tiles
+    # - the outer iteration handles expert E_idx by:
+    #   * shifting the pointer start_idx and end_idx
+    # - the inner iteration goes from start_idx to end_idx or M_block_end, whichever is closer
+    #   * if end_idx < M_block_end, then there are leftover sequences in this CHUNK_M corresponding
+    #     to the next expert. Which then iterates to the outer loop to be handled.
+    # - at th end of the inner iteration, a Lock is grabbed for the (E, G) to update the DW buffer
     while E_idx < E and start_idx < M_block_end:
 
-        # - guarded against illegal access
+        # - guarded against illegal access by E_idx < E above
         end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
 
         # - M tiling
@@ -406,49 +425,37 @@ def _groupXtY_v2(
             dy_blk_ptrs += BLOCK_M * stride_dym
             acc += tl.dot(xt, dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
 
-        # M_Block is done, try to grab the lock
+        # accum is done over BLOCK_M * CHUNK_M samples
+        # - grab a lock to try to update the DW buffer
         while tl.atomic_cas(Lock, 0, 1) == 1:
-            # print ("Lock", Lock)
             pass
 
-        # this is a signal to see if its the first accum in the (K, N) tile
-        # count = tl.load(Count)
-
-        # if count == 0:
-        #     # set the signal so that we will accumulate from now on
-        #     tl.atomic_xchg(Count, 1)
-        # else:
-        #     acc += tl.load(DW_blk_ptrs, mask=mask)
-
+        # Lock aquired. 
+        # - load the partial compute in the DW buffer
+        # - add the partial compute to acc
         partial = tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
         acc += partial
 
-        # print ("E_idx", E_idx)
-
-        # print (
-        #     "partial", 
-        #     tl.load(
-        #         DW_ptr + E_idx * stride_dwe + grp_id * stride_dwg
-        #         + K_block_id * stride_dwk + N_block_id * stride_dwn
-        #     ),
-        # )
-
-        # store
+        # - store the accum back to the DW buffer
         acc = acc.to(DW_blk_ptrs.dtype.element_ty)
         tl.store(DW_blk_ptrs, acc, mask=K_mask[:, None] & N_mask[None, :])
 
-        # release Lock
+        # - release Lock
         tl.atomic_xchg(Lock, 0)
 
-        # this will be the new start index
-        start_idx = tl.load(expert_offsets_ptr).to(tl.int32)
+        # Set end_idx to start_idx as we prepare for the outer iterate
+        # - if start_idx < M_block_end, then there are some more sequences to cover for
+        #   E_idx + 1
+        # - if start_idx >= M_block_end, then the outer iterate will break, in which case the 
+        #   value of E_idx, Lock, and offsets are irrelevant
+        start_idx = end_idx
 
-        # increment
+        # increment E_idx and Lock
+        # - each expert has G locks, so add G
         E_idx += 1
-        Lock += grp_size
-        # Count += grp_size
 
-        # - may go out of bounds
+        # - may go out of bounds, but we will not load if if E_idx < E check fails above
+        Lock += G
         expert_offsets_ptr += 1
 
 
