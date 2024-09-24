@@ -265,6 +265,7 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
     # - need to ensure that stuff is properly zeroed since
     #   there is no zeroing inside the kernel.
     # - allow G groups for each of the E experts
+    # DW = torch.zeros((E * G, X.size(-1), DY.size(-1)), device=DY.device, dtype=DY.dtype)
     DW = torch.zeros((E * G, X.size(-1), DY.size(-1)), device=DY.device, dtype=DY.dtype)
 
     # Locks
@@ -342,18 +343,6 @@ def _groupXtY_v2(
     #   at start_idx
     # - if offset == M_start => ends at offset-1, so exclude
     E_idx = 0
-    end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
-    while E_idx < E and end_idx <= start_idx:
-        E_idx += 1
-        expert_offsets_ptr += 1
-
-        if E_idx < E:
-            # - guard against illegal access
-            end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
-
-    # - each program will stop at the end of the M chunk
-    # - this may cover multiple experts depending on values in expert_offsets_ptr
-    M_block_end = (M_chunk_id + 1) * BLOCK_M * CHUNK_M
 
     # - K and N tile ranges for the current program
     K_block = K_block_id * BLOCK_K + tl.arange(0, BLOCK_K)
@@ -364,42 +353,10 @@ def _groupXtY_v2(
     N_mask = N_block < N
     N_block = tl.max_contiguous(tl.multiple_of(N_block % N, BLOCK_N), BLOCK_N)
 
-    # - use primes to distribute to bin the tile
-    # - TODO: replace with larger primes
-    tile_bin = (K_block_id * 11 + N_block_id * 13) % P
-
-    # - get the E * G locks corresponding to the tile bin
-    Lock += tile_bin * E * G
-
-    # - get the group id for the chunk (within the expert E_idx)
-    grp_id = M_chunk_id % G
-
-    # - get the lock 
-    Lock += E_idx * G + grp_id
-
-    # - the invariant for the inner loop iterations in the chunk that may take place 
-    #   across muliple experts (start_idx < M_block_end)
-    # - process tiles (K, N) tiles of size BLOCK_M. Process a total of CHUNK_M such tiles
-    # - the outer iteration handles expert E_idx by:
-    #   * shifting the pointer start_idx and end_idx
-    # - the inner iteration goes from start_idx to end_idx or M_block_end, whichever is closer
-    #   * if end_idx < M_block_end, then there are leftover sequences in this CHUNK_M corresponding
-    #     to the next expert. Which then iterates to the outer loop to be handled.
-    # - at th end of the inner iteration, a Lock is grabbed for the (E, G) to update the DW buffer
-    while E_idx < E and start_idx < M_block_end:
-
-        # - guarded against illegal access by E_idx < E above
-        end_idx = tl.load(expert_offsets_ptr).to(tl.int32)
-
-        # - M tiling
-        # - M_block set to start from start_idx
-        M_block = tl.max_contiguous(start_idx + tl.arange(0, BLOCK_M), BLOCK_M)
-
-        xt_blk_ptrs = X_ptr + K_block[:, None] * stride_xn + M_block[None, :] * stride_xm
-        dy_blk_ptrs = DY_ptr + M_block[:, None] * stride_dym + N_block[None, :] * stride_dyk
+    while E_idx < E:
 
         # - for output for expert E_idx
-        DW_blk_ptrs = DW_ptr + (E_idx * G + grp_id) * stride_dweg + K_block[:, None] * stride_dwk + N_block[None, :] * stride_dwn
+        DW_blk_ptrs = DW_ptr + (E_idx * G) * stride_dweg + K_block[:, None] * stride_dwk + N_block[None, :] * stride_dwn
 
         # - process for a current expert that runs between 
         #   start_idx and min(end_idx, M_block_end)
@@ -407,56 +364,11 @@ def _groupXtY_v2(
         #   by the next program
         acc = tl.zeros((BLOCK_K, BLOCK_N), dtype=ACC_TYPE)
 
-        # - this is the end_idx that takes into account the M_block_end
-        end_idx2 = tl.minimum(end_idx, M_block_end)
-        iters = tl.cdiv(end_idx2 - start_idx, BLOCK_M)
-        for i in range(0, iters):
-            M_mask = (i * BLOCK_M + M_block) < end_idx2
-            if NO_K_MASK:
-                xt = tl.load(xt_blk_ptrs, mask=M_mask[None, :])
-            else:
-                xt = tl.load(xt_blk_ptrs, mask=K_mask[:, None] & M_mask[None, :])
-            if NO_N_MASK:
-                dy = tl.load(dy_blk_ptrs, mask=M_mask[:, None])
-            else:
-                dy = tl.load(dy_blk_ptrs, mask=M_mask[:, None] & N_mask[None, :])
-
-            xt_blk_ptrs += BLOCK_M * stride_xm
-            dy_blk_ptrs += BLOCK_M * stride_dym
-            acc += tl.dot(xt, dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
-
-        # accum is done over BLOCK_M * CHUNK_M samples
-        # - grab a lock to try to update the DW buffer
-        while tl.atomic_cas(Lock, 0, 1) == 1:
-            pass
-
-        # Lock aquired. 
-        # - load the partial compute in the DW buffer
-        # - add the partial compute to acc
-        partial = tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
-        acc += partial
-
         # - store the accum back to the DW buffer
         acc = acc.to(DW_blk_ptrs.dtype.element_ty)
         tl.store(DW_blk_ptrs, acc, mask=K_mask[:, None] & N_mask[None, :])
 
-        # - release Lock
-        tl.atomic_xchg(Lock, 0)
-
-        # Set end_idx to start_idx as we prepare for the outer iterate
-        # - if start_idx < M_block_end, then there are some more sequences to cover for
-        #   E_idx + 1
-        # - if start_idx >= M_block_end, then the outer iterate will break, in which case the 
-        #   value of E_idx, Lock, and offsets are irrelevant
-        start_idx = end_idx
-
-        # increment E_idx and Lock
-        # - each expert has G locks, so add G
         E_idx += 1
-
-        # - may go out of bounds, but we will not load if if E_idx < E check fails above
-        Lock += G
-        expert_offsets_ptr += 1
 
 
 def group_bwd_AB(DY, X, A, B, scaling, expert_offsets, E):
