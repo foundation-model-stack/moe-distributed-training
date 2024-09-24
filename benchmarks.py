@@ -27,13 +27,23 @@ def benchmark(f, warmup=1, iter=10):
 
 from scattermoe_utils.kernels.ops import scatter2scatter_lora, group_bwd_AB
 from scattermoe.kernels.ops import scatter2scatter, group_bwd_W, padded_block_indices
+from scattermoe_utils.kernels.ops import group_bwd_W_v2
 import torch
 
 def benchmark_group(
-    DY, X, A, B, expert_offsets, **kwargs
+    DY, X, A, B, expert_offsets, fn_args={}, **kwargs
 ):
 
     if A is None or B is None:
+        if 'P' in fn_args:
+            return benchmark(
+                lambda: group_bwd_W_v2(
+                    DY, X, expert_offsets, E=len(expert_offsets), 
+                    G=fn_args['G'], P=fn_args['P']
+                ),
+                **kwargs
+            )
+
         return benchmark(
             lambda: group_bwd_W(DY, X, expert_offsets, E=len(expert_offsets)),
             **kwargs
@@ -133,9 +143,13 @@ def run(
                 bin_ids, indices = torch.sort(torch.tensor(O).to('cuda'))
                 # print (bin_ids)
 
-                if R is not None:
+                _fn_args = {}
+                if isinstance(R, int):
                     A = torch.randn((E, K, R)).to('cuda') / K
                     B = torch.randn((E, R, N)).to('cuda') / N
+                elif isinstance(R, dict):
+                    A, B = None, None 
+                    _fn_args = R
                 else:
                     A, B = None, None 
                 DY = torch.randn((M, N)).to('cuda')
@@ -146,6 +160,7 @@ def run(
                     DY, X, A, B, expert_offsets,
                     warmup=num_warmup,
                     iter=num_trials,
+                    fn_args=_fn_args,
                 )
                 tot *= num_trials
 

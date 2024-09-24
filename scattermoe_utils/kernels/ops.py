@@ -213,34 +213,34 @@ def scatter2scatter_lora(
 
 
 def _config_XtY():
-    #return [
-    #    triton.Config(
-    #        {
-    #            'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32, 
-    #            'GROUP_K': 4, 'GROUP_M': 4,
-    #        }, 
-    #        num_stages=4, num_warps=4
-    #    ),
-    #    triton.Config(
-    #        {
-    #            'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128, 
-    #            'GROUP_K': 4, 'GROUP_M': 4,
-    #        }, 
-    #        num_stages=1, num_warps=4
-    #    ),
-    #]
     return [
         triton.Config(
             {
-                'BLOCK_N': 16, 'BLOCK_K': 16, 'BLOCK_M': 16, 
-                'GROUP_K': 2, 'GROUP_M': 1,
+                'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32, 
+                'GROUP_K': 4, 'GROUP_M': 128,
             }, 
-            num_stages=1, num_warps=1
+            num_stages=4, num_warps=4
+        ),
+        triton.Config(
+            {
+                'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128, 
+                'GROUP_K': 4, 'GROUP_M': 128,
+            }, 
+            num_stages=1, num_warps=4
         ),
     ]
+    # return [
+    #     triton.Config(
+    #         {
+    #             'BLOCK_N': 16, 'BLOCK_K': 16, 'BLOCK_M': 16, 
+    #             'GROUP_K': 2, 'GROUP_M': 2,
+    #         }, 
+    #         num_stages=1, num_warps=1
+    #     ),
+    # ]
 
 # this is our v2 version
-def group_bwd_W_v2(DY, X, expert_offsets, E, G=1):
+def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
     def grid(META):
         grid = (
             triton.cdiv(META['K'], META['BLOCK_K']),
@@ -251,14 +251,11 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1):
 
     # - need to ensure that stuff is properly zeroed since
     #   there is no zeroing inside the kernel
-    DWt = torch.zeros((E, DY.size(-1), X.size(-1)), device=DY.device, dtype=DY.dtype)
-    DW = DWt.permute(0, 2, 1)
-    # lock = torch.zeros(E, 128, 128, dtype=torch.int32, device=DY.device)
-    # count = torch.zeros(E, 128, 128, dtype=torch.int32, device=DY.device)
+    DW = torch.zeros((E, G, X.size(-1), DY.size(-1)), device=DY.device, dtype=DY.dtype)
 
     # - we have G groups per expert
     # - these will be assigned on (K,N,M)
-    Lock = torch.zeros(E * G, dtype=torch.int32, device=DY.device)
+    Lock = torch.zeros(P * E * G, dtype=torch.int32, device=DY.device)
     
     with torch.cuda.device(DY.device):
         _groupXtY_v2[grid](
@@ -266,18 +263,19 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1):
             DY, DY.stride(0), DY.stride(1),
             # X_ptr, stride_xm, stride_xn,
             X, X.stride(0), X.stride(1),
-            # DW_ptr, stride_dwe, stride_dwk, stride_dwn,
-            DW, DW.stride(0), DW.stride(1), DW.stride(2),
+            # DW_ptr, stride_dwg, stride_dwe, stride_dwk, stride_dwn,
+            DW, DW.stride(0), DW.stride(1), DW.stride(2), DW.stride(3),
             # expert_offsets_ptr,
             expert_offsets, Lock,
             # K: tl.constexpr, N: tl.constexpr,
             M=DY.size(0), N=DY.size(-1), K=X.size(-1), E=E,
-            GROUP_E=G,
+            GROUP_E=G, P=P,
             # ACC_TYPE: tl.constexpr,
             ACC_TYPE=tl.float32,
             allow_tf32=True
         )
-        return DW
+        return DW.sum(1) # reduce over groups
+        # return DW
 
 
 # use locking across programs
@@ -291,12 +289,13 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1):
 def _groupXtY_v2(
     DY_ptr, stride_dym, stride_dyk,
     X_ptr, stride_xm, stride_xn,
-    DW_ptr, stride_dwe, stride_dwk, stride_dwn,
+    DW_ptr, stride_dwe, stride_dwg, stride_dwk, stride_dwn,
     expert_offsets_ptr,
     Lock, 
     M, K: tl.constexpr, N: tl.constexpr, E: tl.constexpr, 
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_K: tl.constexpr, GROUP_M: tl.constexpr, GROUP_E: tl.constexpr,
+    P: tl.constexpr,
     ACC_TYPE: tl.constexpr,
     allow_tf32: tl.constexpr,
     NO_K_MASK: tl.constexpr, NO_N_MASK: tl.constexpr,
@@ -349,9 +348,17 @@ def _groupXtY_v2(
     # Lock += E_idx + K_block_id * num0 + N_block_id * num1
     # Count += E_idx + K_block_id * num0 + N_block_id * num1
 
+    grp_size = GROUP_E
+
+    # - also another hash
+    p_bin = (pid0 * 11 + pid1 * 13) % P
+    Lock += p_bin * E * grp_size
+
     # - this behaves like a hash function
-    grp_id = (pid0 * num0 + pid1 * num1 + M_group_id * GROUP_M) % GROUP_E
-    grp_size = E * GROUP_E
+    # grp_id = (pid0 * num0 + pid1 * num1 + M_group_id * GROUP_M) % GROUP_E
+    grp_id = M_group_id % GROUP_E
+
+    # grp_size = E * GROUP_E
     Lock += E_idx * grp_size + grp_id
     # Count += grp_size
 
@@ -373,7 +380,7 @@ def _groupXtY_v2(
         dy_blk_ptrs = DY_ptr + M_block[:, None] * stride_dym + N_block[None, :] * stride_dyk
 
         # - for output for expert E_idx
-        DW_blk_ptrs = DW_ptr + E_idx * stride_dwe + K_block[:, None] * stride_dwk + N_block[None, :] * stride_dwn
+        DW_blk_ptrs = DW_ptr + E_idx * stride_dwe + grp_id * stride_dwg + K_block[:, None] * stride_dwk + N_block[None, :] * stride_dwn
 
         # - process for a current expert that runs between 
         #   start_idx and min(end_idx, M_block_end)
@@ -401,7 +408,7 @@ def _groupXtY_v2(
 
         # M_Block is done, try to grab the lock
         while tl.atomic_cas(Lock, 0, 1) == 1:
-            print ("Lock", Lock)
+            # print ("Lock", Lock)
             pass
 
         # this is a signal to see if its the first accum in the (K, N) tile
@@ -415,6 +422,16 @@ def _groupXtY_v2(
 
         partial = tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
         acc += partial
+
+        # print ("E_idx", E_idx)
+
+        # print (
+        #     "partial", 
+        #     tl.load(
+        #         DW_ptr + E_idx * stride_dwe + grp_id * stride_dwg
+        #         + K_block_id * stride_dwk + N_block_id * stride_dwn
+        #     ),
+        # )
 
         # store
         acc = acc.to(DW_blk_ptrs.dtype.element_ty)
