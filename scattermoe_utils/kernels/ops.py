@@ -262,10 +262,12 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
         )
         return grid
 
+    M, K, N = X.size(0), X.size(-1), DY.size(-1)
+
     # - need to ensure that stuff is properly zeroed since
     #   there is no zeroing inside the kernel.
     # - allow G groups for each of the E experts
-    DW = torch.zeros((E, G, X.size(-1), DY.size(-1)), device=DY.device, dtype=DY.dtype)
+    DW = torch.zeros((E * G, K, N), device=DY.device, dtype=DY.dtype)
 
     # Locks
     # - we require P series of locks, one each for the tiles (K,N)
@@ -278,19 +280,19 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
             DY, DY.stride(0), DY.stride(1),
             # X_ptr, stride_xm, stride_xn,
             X, X.stride(0), X.stride(1),
-            # DW_ptr, stride_dwe, stride_dwg, stride_dwk, stride_dwn,
-            DW, DW.stride(0), DW.stride(1), DW.stride(2), DW.stride(3),
+            # DW_ptr, stride_dweg, stride_dwk, stride_dwn,
+            DW, DW.stride(0), DW.stride(1), DW.stride(2),
             # expert_offsets_ptr,
             expert_offsets, Lock,
             # K: tl.constexpr, N: tl.constexpr,
-            M=DY.size(0), N=DY.size(-1), K=X.size(-1), E=E,
+            M=M, N=N, K=K, E=E,
             G=G, P=P,
             # ACC_TYPE: tl.constexpr,
             ACC_TYPE=tl.float32,
             allow_tf32=True
         )
         # - need to investigate if this needs to be replaced with a kernel or not
-        return DW.sum(1) # reduce over groups
+        return DW.view(E, -1, K, N).sum(1)  # reduce over groups
 
 
 # use locking across programs
@@ -304,7 +306,7 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
 def _groupXtY_v2(
     DY_ptr, stride_dym, stride_dyk,
     X_ptr, stride_xm, stride_xn,
-    DW_ptr, stride_dwe, stride_dwg, stride_dwk, stride_dwn,
+    DW_ptr, stride_dweg, stride_dwk, stride_dwn,
     expert_offsets_ptr,
     Lock, 
     M, K: tl.constexpr, N: tl.constexpr, E: tl.constexpr, 
@@ -399,7 +401,7 @@ def _groupXtY_v2(
         dy_blk_ptrs = DY_ptr + M_block[:, None] * stride_dym + N_block[None, :] * stride_dyk
 
         # - for output for expert E_idx
-        DW_blk_ptrs = DW_ptr + E_idx * stride_dwe + grp_id * stride_dwg + K_block[:, None] * stride_dwk + N_block[None, :] * stride_dwn
+        DW_blk_ptrs = DW_ptr + (E_idx * G + grp_id) * stride_dweg + K_block[:, None] * stride_dwk + N_block[None, :] * stride_dwn
 
         # - process for a current expert that runs between 
         #   start_idx and min(end_idx, M_block_end)
@@ -433,8 +435,8 @@ def _groupXtY_v2(
         # Lock aquired. 
         # - load the partial compute in the DW buffer
         # - add the partial compute to acc
-        partial = tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
-        acc += partial
+        # partial = tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
+        # acc += partial
 
         # - store the accum back to the DW buffer
         acc = acc.to(DW_blk_ptrs.dtype.element_ty)
