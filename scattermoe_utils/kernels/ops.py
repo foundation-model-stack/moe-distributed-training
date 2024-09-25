@@ -229,15 +229,6 @@ def _config_XtY():
             num_stages=1, num_warps=4
         ),
     ]
-    # return [
-    #     triton.Config(
-    #         {
-    #             'BLOCK_N': 16, 'BLOCK_K': 16, 'BLOCK_M': 16, 
-    #             'GROUP_K': 2, 'CHUNK_M': 2,
-    #         }, 
-    #         num_stages=1, num_warps=1
-    #     ),
-    # ]
 
 # this is version2 that chunks the sequence (M) dimension into groups.
 # - the M dimension will get chunked to scale as M increases.
@@ -264,15 +255,16 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
 
     M, K, N = X.size(0), X.size(-1), DY.size(-1)
 
-    # - need to ensure that stuff is properly zeroed since
-    #   there is no zeroing inside the kernel.
     # - allow G groups for each of the E experts
     DW = torch.zeros((E * G, K, N), device=DY.device, dtype=DY.dtype)
 
     # Locks
     # - we require P series of locks, one each for the tiles (K,N)
     # - then of the P's will have E * G locks, for the experts X CHUNK_M
-    Lock = torch.zeros(P * E * G, dtype=torch.int32, device=DY.device)
+    # - its a waste, but we need to use int32 for atomic xchange
+    # - we have 2 * G elements, one for 0/1 lock and the other for 0/1 test
+    #   for prescence of a previous partial accum.
+    Lock = torch.zeros(P * E * 2 * G, dtype=torch.int32, device=DY.device)
     
     with torch.cuda.device(DY.device):
         _groupXtY_v2[grid](
@@ -297,7 +289,12 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
 
 # use locking across programs
 # - https://triton-lang.org/main/getting-started/tutorials/05-layer-norm.html
-@triton.autotune(configs=_config_XtY(), key=['N', 'K'], )
+# - restore_value ensures that `DW_ptr` is properly reset after autotune completes.
+@triton.autotune(
+    configs=_config_XtY(), 
+    key=['N', 'K'], 
+    restore_value=['DW_ptr']
+)
 @triton.heuristics({
     "NO_K_MASK": lambda args: (args['K'] % args['BLOCK_K']) == 0,
     "NO_N_MASK": lambda args: (args['N'] % args['BLOCK_N']) == 0,
@@ -371,13 +368,14 @@ def _groupXtY_v2(
     tile_bin = (K_block_id * 11 + N_block_id * 13) % P
 
     # - get the E * G locks corresponding to the tile bin
-    Lock += tile_bin * E * G
+    Lock += tile_bin * E * 2 * G
 
     # - get the group id for the chunk (within the expert E_idx)
     grp_id = M_chunk_id % G
 
-    # - get the lock 
-    Lock += E_idx * G + grp_id
+    # - get the lock and the previous accumulate signal
+    Lock += E_idx * 2 * G + grp_id
+    Previous = Lock + G
 
     # - the invariant for the inner loop iterations in the chunk that may take place 
     #   across muliple experts (start_idx < M_block_end)
@@ -434,9 +432,12 @@ def _groupXtY_v2(
 
         # Lock aquired. 
         # - load the partial compute in the DW buffer
-        # - add the partial compute to acc
-        # partial = tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
-        # acc += partial
+        # - add the partial compute to acc if the previous flag is not null
+        prev_flag = tl.load(Previous)
+        if prev_flag == 0:
+            tl.atomic_xchg(Previous, 1) # update to having a previous
+        else:
+            acc += tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
 
         # - store the accum back to the DW buffer
         acc = acc.to(DW_blk_ptrs.dtype.element_ty)
@@ -457,7 +458,8 @@ def _groupXtY_v2(
         E_idx += 1
 
         # - may go out of bounds, but we will not load if if E_idx < E check fails above
-        Lock += G
+        Lock += 2 * G
+        Previous += 2 * G
         expert_offsets_ptr += 1
 
 
