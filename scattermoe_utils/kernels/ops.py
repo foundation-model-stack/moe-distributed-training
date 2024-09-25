@@ -217,17 +217,24 @@ def _config_XtY():
         triton.Config(
             {
                 'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32, 
-                'GROUP_K': 4, 'CHUNK_M': 128,
+                'GROUP_K': 4, 'CHUNK_M': 512,
             }, 
             num_stages=4, num_warps=4
         ),
         triton.Config(
             {
                 'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128, 
-                'GROUP_K': 4, 'CHUNK_M': 128,
+                'GROUP_K': 4, 'CHUNK_M': 512,
             }, 
-            num_stages=1, num_warps=4
+            num_stages=1, num_warps=16
         ),
+        # triton.Config(
+        #     {
+        #         'BLOCK_N': 16, 'BLOCK_K': 16, 'BLOCK_M': 16, 
+        #         'GROUP_K': 4, 'CHUNK_M': 4,
+        #     }, 
+        #     num_stages=1, num_warps=8
+        # ),
     ]
 
 # this is version2 that chunks the sequence (M) dimension into groups.
@@ -285,6 +292,7 @@ def group_bwd_W_v2(DY, X, expert_offsets, E, G=1, P=1):
         )
         # - need to investigate if this needs to be replaced with a kernel or not
         return DW.view(E, -1, K, N).sum(1)  # reduce over groups
+        # return DW
 
 
 # use locking across programs
@@ -325,6 +333,7 @@ def _groupXtY_v2(
     pid2 = tl.program_id(axis=2)
     num0 = tl.num_programs(0)
     num1 = tl.num_programs(1)
+    num2 = tl.num_programs(2)
 
     # - swizzle it up to improve cache usage
     pid0, pid1 = tl.swizzle2d(pid0, pid1, num0, num1, GROUP_K)
@@ -367,11 +376,14 @@ def _groupXtY_v2(
     # - TODO: replace with larger primes
     tile_bin = (K_block_id * 11 + N_block_id * 13) % P
 
-    # - get the E * G locks corresponding to the tile bin
-    Lock += tile_bin * E * 2 * G
+    if num2 > 1:
+        # - get the E * G locks corresponding to the tile bin
+        Lock += tile_bin * E * 2 * G
 
-    # - get the group id for the chunk (within the expert E_idx)
-    grp_id = M_chunk_id % G
+        # - get the group id for the chunk (within the expert E_idx)
+        grp_id = M_chunk_id % G
+    else:
+        grp_id = 0
 
     # - get the lock and the previous accumulate signal
     Lock += E_idx * 2 * G + grp_id
@@ -425,26 +437,29 @@ def _groupXtY_v2(
             dy_blk_ptrs += BLOCK_M * stride_dym
             acc += tl.dot(xt, dy, out_dtype=ACC_TYPE, allow_tf32=allow_tf32)
 
-        # accum is done over BLOCK_M * CHUNK_M samples
-        # - grab a lock to try to update the DW buffer
-        while tl.atomic_cas(Lock, 0, 1) == 1:
-            pass
+        if num2 > 1:
+            # accum is done over BLOCK_M * CHUNK_M samples
+            # - grab a lock to try to update the DW buffer
+            while tl.atomic_cas(Lock, 0, 1) == 1:
+                pass
 
-        # Lock aquired. 
-        # - load the partial compute in the DW buffer
-        # - add the partial compute to acc if the previous flag is not null
-        prev_flag = tl.load(Previous)
-        if prev_flag == 0:
-            tl.atomic_xchg(Previous, 1) # update to having a previous
-        else:
-            acc += tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
+            # # Lock aquired. 
+            # # - load the partial compute in the DW buffer
+            # # - add the partial compute to acc if the previous flag is not null
+            prev_flag = tl.load(Previous)
+            if prev_flag == 0:
+                # tl.atomic_xchg(Previous, 1) # update to having a previous
+                tl.store(Previous, 1) # update to having a previous
+            else:
+                acc += tl.load(DW_blk_ptrs, mask=K_mask[:, None] & N_mask[None, :])
 
         # - store the accum back to the DW buffer
         acc = acc.to(DW_blk_ptrs.dtype.element_ty)
         tl.store(DW_blk_ptrs, acc, mask=K_mask[:, None] & N_mask[None, :])
 
         # - release Lock
-        tl.atomic_xchg(Lock, 0)
+        if num2 > 1:
+            tl.atomic_xchg(Lock, 0)
 
         # Set end_idx to start_idx as we prepare for the outer iterate
         # - if start_idx < M_block_end, then there are some more sequences to cover for
@@ -458,8 +473,9 @@ def _groupXtY_v2(
         E_idx += 1
 
         # - may go out of bounds, but we will not load if if E_idx < E check fails above
-        Lock += 2 * G
-        Previous += 2 * G
+        if num2 > 1:
+            Lock += 2 * G
+            Previous += 2 * G
         expert_offsets_ptr += 1
 
 
