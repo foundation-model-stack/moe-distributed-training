@@ -1,4 +1,4 @@
-import sys
+import sys, os
 from typing import List
 
 import numpy as np
@@ -26,9 +26,23 @@ def benchmark(f, warmup=1, iter=10):
 
 
 from scattermoe_utils.kernels.ops import scatter2scatter_lora, group_bwd_AB
-from scattermoe.kernels.ops import scatter2scatter, group_bwd_W, padded_block_indices
 from scattermoe_utils.kernels.ops import group_bwd_W_v2
+
+LOADED_KERNEL_HYPERDRIVE = False
+if os.environ.get('LOAD_KERNEL_HYPERDRIVE', 'true') == "true":
+    try:
+        # this is from Mayank's repo
+        from khd.kernels.scattermoe.triton_implementation.ops import scatter2scatter, group_bwd_W, padded_block_indices
+        LOADED_KERNEL_HYPERDRIVE = True
+        print('scatter kernels loaded kernel-hyperdrive')
+    except ImportError as e:
+        pass
+
+if not LOADED_KERNEL_HYPERDRIVE:
+    from scattermoe.kernels.ops import scatter2scatter, group_bwd_W, padded_block_indices
+
 import torch
+import inspect
 
 def benchmark_group(
     DY, X, A, B, expert_offsets, fn_args={}, **kwargs
@@ -44,10 +58,20 @@ def benchmark_group(
                 **kwargs
             )
 
-        return benchmark(
-            lambda: group_bwd_W(DY, X, expert_offsets, E=len(expert_offsets)),
-            **kwargs
-        )
+        if 'DW' in inspect.signature(group_bwd_W).parameters:
+            DW = torch.zeros(
+                (len(expert_offsets), X.size(-1), DY.size(-1)),
+                device=DY.device, dtype=DY.dtype
+            )
+            return benchmark(
+                lambda: group_bwd_W(DY, X, expert_offsets, DW=DW, E=len(expert_offsets)),
+                **kwargs
+            )
+        else:
+            return benchmark(
+                lambda: group_bwd_W(DY, X, expert_offsets, E=len(expert_offsets)),
+                **kwargs
+            )
 
     return benchmark(
         lambda: group_bwd_AB(DY, X, A, B, 1., expert_offsets, E=len(expert_offsets)),
