@@ -237,6 +237,19 @@ def _config_XtY():
         # ),
     ]
 
+    # return [
+    #     triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 32}, num_stages=4, num_warps=4),
+    #     triton.Config({'BLOCK_N': 128, 'BLOCK_K': 32, 'BLOCK_M': 128}, num_stages=4, num_warps=4),
+    #     triton.Config({'BLOCK_N': 32, 'BLOCK_K': 128, 'BLOCK_M': 128}, num_stages=4, num_warps=4),
+    #     triton.Config({'BLOCK_N': 128, 'BLOCK_K': 64, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
+    #     triton.Config({'BLOCK_N': 64, 'BLOCK_K': 64, 'BLOCK_M': 128}, num_stages=4, num_warps=4),
+    #     triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=4, num_warps=4),
+    #     triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 128}, num_stages=1, num_warps=4),
+    #     triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'BLOCK_M': 64}, num_stages=2, num_warps=4),
+    # ]
+
+
+
 # this is version2 that chunks the sequence (M) dimension into groups.
 # - the M dimension will get chunked to scale as M increases.
 # - each chunk will take CHUNK_M number of BLOCK_M.

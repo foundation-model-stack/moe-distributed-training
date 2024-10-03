@@ -25,7 +25,8 @@ def benchmark(f, warmup=1, iter=10):
     return res
 
 
-from scattermoe_utils.kernels.ops import scatter2scatter_lora, group_bwd_AB
+# from scattermoe_utils.kernels.ops import scatter2scatter_lora, group_bwd_AB
+# from khd.kernels.scattermoe.triton_implementation.ops.compileable_ops import group_bwd_AB
 from scattermoe_utils.kernels.ops import group_bwd_W_v2
 
 LOADED_KERNEL_HYPERDRIVE = False
@@ -73,10 +74,27 @@ def benchmark_group(
                 **kwargs
             )
 
-    return benchmark(
-        lambda: group_bwd_AB(DY, X, A, B, 1., expert_offsets, E=len(expert_offsets)),
-        **kwargs
-    )
+    # if 'DA' in inspect.signature(group_bwd_AB).parameters:
+    #     DA = torch.zeros(
+    #         (len(expert_offsets), X.size(-1), A.size(2)),
+    #         device=DY.device, dtype=DY.dtype
+    #     )
+    #     DB = torch.zeros(
+    #         (len(expert_offsets), A.size(1), DY.size(-1)),
+    #         device=DY.device, dtype=DY.dtype
+    #     )
+    #     return benchmark(
+    #         lambda: group_bwd_AB(
+    #             DY, X, A, B, 1., expert_offsets, 
+    #             DA=DA, DB=DB, E=len(expert_offsets)
+    #         ),
+    #         **kwargs
+    #     )
+    # else:
+    #     return benchmark(
+    #         lambda: group_bwd_AB(DY, X, A, B, 1., expert_offsets, E=len(expert_offsets)),
+    #         **kwargs
+    #     )
 
 def get_histograms(
     rng: np.random.Generator,

@@ -99,13 +99,23 @@ class ParallelLinearLora(torch.autograd.Function):
             d_expanded_input = grouped_x
 
         # 1. compute weight gradients on the grouped grad_out and x
-        d_weights_A, d_weights_B = ops.group_bwd_AB(
+        # d_weights_A, d_weights_B = ops.group_bwd_AB(
+        #     DY=grouped_grad_out, X=grouped_x,
+        #     A=expert_lora_A, B=expert_lora_B,
+        #     expert_offsets=expert_offsets,
+        #     E=expert_weights.size(0),
+        #     scaling=(lora_alp / lora_r),
+        # )
+        DW = orig_kernels.ops.group_bwd_W(
             DY=grouped_grad_out, X=grouped_x,
-            A=expert_lora_A, B=expert_lora_B,
             expert_offsets=expert_offsets,
             E=expert_weights.size(0),
-            scaling=(lora_alp / lora_r),
+
         )
+        d_weights_A = DW @ expert_lora_B.permute(0, 2, 1)  * (lora_alp / lora_r)
+        d_weights_B =  expert_lora_A.permute(0, 2, 1)  @ DW * (lora_alp / lora_r)
+
+        # import pdb; pdb.set_trace()
 
         # NOTE: this maybe can be fused
         # 2. compute the input gradients.
