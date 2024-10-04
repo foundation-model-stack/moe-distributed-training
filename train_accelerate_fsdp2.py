@@ -241,7 +241,8 @@ def main(
             use_lora in {"all", "mlp-only"} # if need adapters
         ):
             # add these extra here 
-            tm += ["up_proj", "down_proj", "gate_proj"]
+            tm += ["w1", "w2", "w3"]
+
 
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,

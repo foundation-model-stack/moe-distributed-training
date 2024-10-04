@@ -154,8 +154,28 @@ def parallel_linear_lora(
     lora_r, lora_alp, k,
     sorted_expert_idxs, sorted_scattered_idxs,
     padded_block_idxs, expert_offsets,
-    gates=None, grouped_in=False, grouped_out=False
+    gates=None, grouped_in=False, grouped_out=False,
+    use_khd=True,
 ):
+
+    if use_khd:
+        from khd.kernels.scattermoe.triton_implementation.ops import _ScatteredExperts
+        return _ScatteredExperts.apply(
+            inputs,
+            expert_weights,
+            k,
+            sorted_expert_idxs,
+            sorted_scattered_idxs,
+            padded_block_idxs,
+            expert_offsets,
+            gates,
+            grouped_in,
+            grouped_out,
+            expert_lora_A,
+            expert_lora_B,
+            lora_alp
+        )
+
     results = ParallelLinearLora.apply(
         inputs, expert_weights, 
         expert_lora_A, expert_lora_B, 
