@@ -53,6 +53,7 @@ def main(
     gradient_accumulation_steps: int = 1,
     use_megablocks_sharding: bool = False,
     use_scattermoe: bool = False,
+    use_tp_sharding: bool = False,
     lr_scheduler_type: str = 'linear',
     num_epochs: int = 1,
     num_warmup_steps: int = 0,
@@ -119,7 +120,7 @@ def main(
             "megablocks sharding."
         )
 
-    if use_megablocks_sharding:
+    if use_megablocks_sharding or use_tp_sharding:
 
         if expert_degree is None:
             expert_degree = world_size
@@ -133,6 +134,10 @@ def main(
                     "pip install -r requirements-scattermoe.txt"
                 )
 
+        assert use_megablocks_sharding + use_tp_sharding == 1, \
+            "must choose between megabocks or tp_sharding"
+
+        # if use_megablocks_sharding:
         device_mesh = shard_moe(
             model, 
             MixtralSparseMoeBlock, 
@@ -151,6 +156,7 @@ def main(
                 )
             ),
         )
+        # elif use_tp_sharding:
 
         # NOTE: this is a hack to hve the FSDP fully_shard ignore the MoE 
         # module, whilst sharding the attention module.
@@ -161,6 +167,10 @@ def main(
             setattr(
                 layer.block_sparse_moe, REGISTRY_KEY, {'replicate'}
             )
+    elif use_tp_sharding:
+        assert expert_degree is not None, "for tp sharding please expert degree < world_size"
+
+        
     else:
         device_mesh = init_device_mesh(
             "cuda", 
