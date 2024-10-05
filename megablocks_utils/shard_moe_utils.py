@@ -244,7 +244,7 @@ def shard_moe(
         else:
             def _get_placements_tp(weight_name, param):
                 return Shard(
-                    0 if param.shape[0] > param.shape[1] else 1
+                    1 if param.shape[0] > param.shape[1] else 0
                 )
             # - for mlp we shard w1 w3 at the hidden, and w2 at the hidden also
             # - this is equiv to sharding at the shorter dimension

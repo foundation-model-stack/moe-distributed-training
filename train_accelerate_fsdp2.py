@@ -274,6 +274,7 @@ def main(
             from megablocks.layers.moe import ParallelMLP
             from megablocks.layers.dmoe import ParallelDroplessMLP
             from megablocks_utils.peft_utils import ParallelDroplessMLP as LoRAParallelDroplessMLP, ARTIFACTS
+            from megablocks_utils.peft_utils import ParallelMLP as LoRADroplessMLP
 
             # inject this so we can replicate
             ARTIFACTS['device_mesh'] = device_mesh
@@ -282,7 +283,7 @@ def main(
             # a supported class
             peft_config._register_custom_module({
                 ParallelDroplessMLP: LoRAParallelDroplessMLP,
-                ParallelMLP: LoRAParallelDroplessMLP,
+                ParallelMLP: LoRADroplessMLP,
             })
             
             peft_config.target_modules.add("experts")

@@ -112,6 +112,7 @@ def update_mlp_registry():
             scattered_experts = parallel_linear
             get_weights = get_mlp_weights
 
+        torch.distributed.breakpoint(0)
         hidden_states = scattered_experts(
             x,
             *get_weights(self, "w1"),
@@ -124,6 +125,8 @@ def update_mlp_registry():
             grouped_in=False,
             grouped_out=True,
         )
+        ds = 1
+        torch.distributed.breakpoint(0)
         hidden_states2 = scattered_experts(
             x,
             *get_weights(self, "w3"),
@@ -217,6 +220,8 @@ def update_mlp_registry():
             # in_shape = x.size()
             x = x.view(-1, x.shape[-1])
 
+
+        print ("rank-bef-perm-compu", torch.distributed.get_rank())
         x = permute_and_compute(
             self, x, tokens_per_expert, indices,
             bin_ids, expert_weights, bins, expert_capacity, top_k
@@ -224,8 +229,11 @@ def update_mlp_registry():
         # following
         # https://github.com/IBM/dolomite-engine/blob/b3ad5703ae32060f07339b664d3caca3e2c5e70a/dolomite_engine/hf_models/models/moe_dolomite/moe/base.py
 
+        print ("rank-bef", torch.distributed.get_rank())
+        from time import sleep
+        sleep(100000)
         y = ops.scatter(x, indices, bin_ids, expert_weights, bins, top_k)
-        print (y)
+        print ("rank-af", torch.distributed.get_rank())
         return y
 
         # x *= expert_weights.unsqueeze()
