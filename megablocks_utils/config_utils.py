@@ -7,6 +7,7 @@ from megablocks.layers.dmlp_registry import _REGISTRY
 # from megablocks.layers import mlp
 from .sparse_mlp2 import SparseMLPv2
 from .peft_utils import ParallelDroplessMLP as LoRAParallelDroplessMLP
+import megablocks.ops as ops
 from megablocks.layers.moe import ParallelMLP
 from megablocks.layers.dmoe import ParallelDroplessMLP
 from megablocks.layers.mlp import resolve_dtensor
@@ -114,7 +115,7 @@ def update_mlp_registry():
         hidden_states = scattered_experts(
             x,
             *get_weights(self, "w1"),
-            1,
+            1 if self.args.moe_expert_model_parallelism else top_k,
             bin_ids, # sorted_expert_idxs,
             indices, # sorted_scattered_idxs,
             padded_block_idxs,
@@ -126,7 +127,7 @@ def update_mlp_registry():
         hidden_states2 = scattered_experts(
             x,
             *get_weights(self, "w3"),
-            1,
+            1 if self.args.moe_expert_model_parallelism else top_k,
             bin_ids, # sorted_expert_idxs,
             indices, # sorted_scattered_idxs,
             padded_block_idxs,
@@ -160,7 +161,6 @@ def update_mlp_registry():
         expert_capactiy,
         top_k,
     ):
-
         if self.args.mlp_impl == 'sparse':
             _func = self.sparse_permute_and_compute
         elif self.args.mlp_impl == 'scattermoe':
@@ -184,6 +184,60 @@ def update_mlp_registry():
     _REGISTRY['mlp']['scattermoe'] = SparseMLPv2
     
     ParallelDroplessMLP.permute_and_compute = permute_and_compute
+
+    # this is the permute and compute for the ParallelMLP version
+    # - we need to overide it with the above permute and compute
+    # - the "dmoe" version of parallel and compute has the 
+    #   binned gather and scatter done outside
+    # - this needs to reduce the expert weights
+    def permute_and_compute_parallel_mlp(
+        self,
+        x,
+        tokens_per_expert,  # unused
+        indices,
+        bin_ids,  # unused
+        expert_weights,
+        bins,
+        expert_capacity,
+        top_k,
+    ):
+        # Route the tokens for MoE computation.
+        # x = x.view(-1, x.shape[-1])
+        # x = ops.binned_gather(x, indices, bins, expert_capacity, top_k)
+
+        # Perform the expert computation. Note that we don't
+        # use biases for these linear operations.
+        # x = self.mlp(x)
+
+        # need to handle the weights
+        # in_shape = None
+        # torch.distributed.breakpoint()
+        # this is done in the MoE.permute_and_compute
+        if len(x.shape) == 3:
+            # in_shape = x.size()
+            x = x.view(-1, x.shape[-1])
+
+        x = permute_and_compute(
+            self, x, tokens_per_expert, indices,
+            bin_ids, expert_weights, bins, expert_capacity, top_k
+        )
+        # following
+        # https://github.com/IBM/dolomite-engine/blob/b3ad5703ae32060f07339b664d3caca3e2c5e70a/dolomite_engine/hf_models/models/moe_dolomite/moe/base.py
+
+        y = ops.scatter(x, indices, bin_ids, expert_weights, bins, top_k)
+        print (y)
+        return y
+
+        # x *= expert_weights.unsqueeze()
+        # if in_shape is not None:
+        #     x = x.view(in_shape)
+        x = x.view(expert_weights.shape)
+
+        # Un-route the data for the MoE output.
+        return ops.binned_scatter(x, indices, expert_weights, bins, top_k)
+
+    ParallelMLP.permute_and_compute = permute_and_compute_parallel_mlp
+    # ParallelMLP.permute_and_compute = permute_and_compute
 
     def forward_router(self, x):
         if self.training and self.args.moe_jitter_eps is not None:

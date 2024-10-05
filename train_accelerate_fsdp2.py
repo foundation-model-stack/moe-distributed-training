@@ -114,10 +114,10 @@ def main(
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
 
-    if use_scattermoe and not use_megablocks_sharding:
+    if use_scattermoe and not (use_megablocks_sharding or use_tp_sharding):
         raise ValueError(
             "use_scatter_moe==True only works if performing "
-            "megablocks sharding."
+            "megablocks sharding or tp sharding."
         )
 
     if use_megablocks_sharding or use_tp_sharding:
@@ -153,8 +153,10 @@ def main(
                 mlp_impl=(
                     "sparse" if not use_scattermoe else
                     "scattermoe"
-                )
+                ),
+                use_tensor_parallelism=use_tp_sharding,
             ),
+            parallize_tensor=use_tp_sharding
         )
         # elif use_tp_sharding:
 
@@ -264,10 +266,12 @@ def main(
         )
 
         if (
-            use_megablocks_sharding and use_lora in {'all', 'mlp-only'}
+            (use_megablocks_sharding or use_tp_sharding)
+            and use_lora in {'all', 'mlp-only'}
         ):
             assert use_scattermoe, "lora adapters cannot be used on MLP without scattermoe"
 
+            from megablocks.layers.moe import ParallelMLP
             from megablocks.layers.dmoe import ParallelDroplessMLP
             from megablocks_utils.peft_utils import ParallelDroplessMLP as LoRAParallelDroplessMLP, ARTIFACTS
 
@@ -277,11 +281,20 @@ def main(
             # inject a custom module for MLP since SparseMLP is not 
             # a supported class
             peft_config._register_custom_module({
-                ParallelDroplessMLP: LoRAParallelDroplessMLP
+                ParallelDroplessMLP: LoRAParallelDroplessMLP,
+                ParallelMLP: LoRAParallelDroplessMLP,
             })
             
             peft_config.target_modules.add("experts")
 
+        # NOTE: since this is done before prepare model
+        # - since we REGISTRY_KEY='replicate" for the moe above, we ignore any
+        #   FSDP2 sharding for the moe
+        # - for the case use_megablocks_sharding this is ok, since the adapters for each
+        #   shard is seperate
+        # - however for use_tp_sharding the adapter gradients will not be 
+        #   reduced, and it is currently not accurate. TODO: add some ocde
+        #   to reduce the adapter weights for this case
         model = prepare_peft(
             model, peft_config, 
             gradient_checkpointing=True,
