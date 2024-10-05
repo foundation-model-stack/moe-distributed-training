@@ -29,13 +29,14 @@ def get_moe_kwargs(
     fp16: bool = False,
     bf16: bool = False,
     mlp_impl: str = 'sparse',
+    use_tensor_parallelism: bool = False,
 ):
     return {
         "hidden_size": config.hidden_size,
         "ffn_hidden_size": config.intermediate_size,
         "moe_num_experts": config.num_local_experts,
         "moe_top_k": config.num_experts_per_tok,
-        "moe_expert_model_parallelism": True,
+        "moe_expert_model_parallelism": not use_tensor_parallelism,
         "memory_optimized_mlp": False,
         "bias": has_bias,
         "moe_normalize_expert_weights": True,
@@ -133,6 +134,7 @@ def assign_mlp_v2_weights(
     settings: Dict,
     device_mesh, 
     placements,
+    parallize_tensor: bool = False,
 ):
     # typically they all should be same file
     with ExitStack() as stack:
@@ -164,24 +166,24 @@ def assign_mlp_v2_weights(
             requires_grad = getattr(mod, name).requires_grad
 
             # concat on dim 0 and distribute
+            nparts = len(data)
             param = torch.concat(data, dim=DIM_EXPERT).to(mod_dtype)
             _placements = placements
             if KEY_ROUTER in weight_name:
                 # - the router needs to be replicated
                 _placements = [Replicate() for _ in range(len(placements))]
-            elif len(placements) == 2 and isinstance(placements[1], str):
-                if placements[1] == 'shortest-non-ep':
-                    import numpy as np
-                    _, i = np.argmin([
-                        (
-                            s if i != DIM_EXPERT else np.iinfo(np.int32).max
-                        ) for s in enumerate(param.shape)
-                    ])
-                    placements[1] = Shard(i)
-
-                else:
-                    raise NotImplementedError('unknown placement scheme')
-            
+            elif parallize_tensor:
+                # need to interleave
+                # 
+                _, ep_size = device_mesh.shape
+                dim1_part = param.shape[0] // nparts
+                dim2 = param.shape[1]
+                I = torch.arange(nparts * ep_size).view(
+                    -1, ep_size
+                ).permute(1, 0).reshape(-1)
+                param = param.view(
+                    -1,  dim1_part // ep_size, dim2
+                )[I].reshape(-1, dim2)
 
             param = torch.nn.Parameter(
                 distribute_tensor(param, device_mesh, _placements),
@@ -203,7 +205,8 @@ def shard_moe(
     parallize_tensor: bool = False,
 ):
     # guarded import
-    from megablocks.layers import dmoe, arguments, mpu
+    from megablocks.layers import moe, dmoe, arguments, mpu
+    from megablocks.layers import dmlp_registry
     from .tpmoe import TpMoE
 
     assert ep_size > 1, "this function is used for sharding moe" 
@@ -234,18 +237,12 @@ def shard_moe(
             (dp_size, ep_size),
             mesh_dim_names=(key_dp, key_ep),
         )
-
-        if not parallize_tensor:
-            placements: List[Placement] = [Replicate(), Shard(DIM_EXPERT)]
-        else:
-            # - for mlp we shard w1 w3 at the hidden, and w2 at the hidden also
-            # - this is equiv to sharding at the shorter dimension
-            # https://pytorch.org/tutorials/intermediate/TP_tutorial.html
-            placements: List[Placement] = [Replicate(), 'shortest-non-ep']
+        placements: List[Placement] = [Replicate(), Shard(DIM_EXPERT)]
 
     mp_dmoe_args = arguments.Arguments(
         **moe_kwargs, device=device,
         expert_parallel_group=device_mesh[key_ep].get_group(0)
+        
     )
 
     assert mp_dmoe_args.moe_num_experts % world_size == 0, \
@@ -291,11 +288,15 @@ def shard_moe(
                 if not parallize_tensor:
                     mp_dmoe = dmoe.dMoE(mp_dmoe_args) # drop in replacement for now
                 else:
-                    mp_dmoe = TpMoE(mp_dmoe_args)
+                    mp_dmoe = moe.MoE(mp_dmoe_args)
+                    exp = mp_dmoe.experts
+                    exp.hidden_size = mp_dmoe_args.hidden_size
+                    exp.ffn_hidden_size = mpu.features_per_rank(mp_dmoe_args) // ep_size
+                    exp.mlp = dmlp_registry.get(mp_dmoe_args)
 
             assign_mlp_v2_weights(
                 mp_dmoe, loc, settings, 
-                device_mesh, placements
+                device_mesh, placements, parallize_tensor
             )
             parent = model.get_submodule(prefix)
             setattr(parent, module_name, mp_dmoe)
