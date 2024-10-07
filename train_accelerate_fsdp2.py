@@ -176,7 +176,7 @@ def main(
     else:
         device_mesh = init_device_mesh(
             "cuda", 
-            (world_size,), mesh_dim_names=('dp', )
+            (world_size,), mesh_dim_names=('data_parallel', )
         )
 
     mp_policy = MixedPrecisionPolicy(
@@ -339,9 +339,47 @@ def main(
     )
 
     # - prepare for distributed training 
-    dataloader, optimizer, scheduler = accelerator.prepare(
-        dataloader, optimizer, scheduler
-    )
+    if not use_tp_sharding:
+        dataloader, optimizer, scheduler = accelerator.prepare(
+            dataloader, optimizer, scheduler
+        )
+    else:
+        # need to check 
+        dp_mesh = device_mesh["data_parallel"]
+        dp_num_processes, dp_process_index = dp_mesh.size(), dp_mesh.get_local_rank()
+        num_processes = accelerator.num_processes
+
+        # redo the scheduler to scale up the number of train steps
+        # - have to do this because having trouble configuring accelerator
+        scheduler = get_scheduler(
+            lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=(
+                len(dataloader) * (num_processes / dp_num_processes) // 
+                gradient_accumulation_steps * num_epochs
+            ),
+        )
+        optimizer, scheduler = accelerator.prepare(
+            optimizer, scheduler
+        )
+
+        from accelerate.data_loader import prepare_data_loader
+        dataloader = prepare_data_loader(
+            dataloader, 
+            accelerator.device,
+            num_processes=dp_num_processes,
+            process_index=dp_process_index,
+            split_batches=accelerator.split_batches,
+            put_on_device=True,
+            rng_types=accelerator.rng_types.copy(),
+            dispatch_batches=accelerator.dispatch_batches,
+            even_batches=accelerator.even_batches,
+            # slice_fn_for_dispatch=slice_fn_for_dispatch,
+            use_seedable_sampler=accelerator.use_seedable_sampler,
+            non_blocking=accelerator.non_blocking,
+            use_stateful_dataloader=accelerator.use_stateful_dataloader,
+        )
 
     # after prepare compute these (note the dataloader length will change here)
     num_update_steps_per_epoch = len(dataloader) // gradient_accumulation_steps
@@ -369,11 +407,6 @@ def main(
 
             for batch in dataloader:
 
-                # if torch.distributed.get_rank() == 0:
-                #     torch.save(batch, 'batch')
-                # torch.distributed.breakpoint()
-                batch = torch.load('batch.pt')
-
                 step += 1
 
                 inputs, targets = batch['input_ids'], batch['labels']
@@ -392,6 +425,9 @@ def main(
 
                 if accelerator.sync_gradients:
                     try:
+
+                        # NOTE: known issue that grad norm is not matching
+                        # for the TP case
                         _grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                         # if its a DTensor we need to do this
                         _grad_norm = _grad_norm.to_local()
