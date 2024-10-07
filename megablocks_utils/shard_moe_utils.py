@@ -166,23 +166,32 @@ def assign_mlp_v2_weights(
             requires_grad = getattr(mod, name).requires_grad
 
             # concat on dim 0 and distribute
-            nparts = len(data)
+            num_experts = len(data)
             param = torch.concat(data, dim=DIM_EXPERT).to(mod_dtype)
             _placements = placements
             if KEY_ROUTER in weight_name:
                 # - the router needs to be replicated
                 _placements = [Replicate() for _ in range(len(placements))]
             elif parallize_tensor:
-                # need to interleave
-                # 
-                _, ep_size = device_mesh.shape
-                dim1_part = param.shape[0] // nparts
+                # in the TP case, we need to inteleave DIM_EXPERT
+                # - we assume the ex
+                # e.g., ep_size = 4
+                assert len(device_mesh.shape) > 1, "TP cannot work with 1D mesh"
+                ep_size = device_mesh.shape[-1] # assume its the last dim
+
+                # - this is the number of features per expert
+                dim1_part = param.shape[0] // num_experts
                 dim2 = param.shape[1]
-                I = torch.arange(nparts * ep_size).view(
+                # - create a strided index, e.g. 8 experts, ep_size=4
+                #   then I = [0, 4, 8, ..., 28, 1, 5, ...]
+                I = torch.arange(num_experts * ep_size).view(
                     -1, ep_size
                 ).permute(1, 0).reshape(-1)
+                # - cut the features per expert and interleave
                 param = param.view(
-                    -1,  dim1_part // ep_size, dim2
+                    num_experts * ep_size, # e.g., groups of size 8, each of size 4
+                    dim1_part // ep_size,  # e.g., expert features cut split by 4
+                    dim2
                 )[I].reshape(-1, dim2)
 
             param = torch.nn.Parameter(
@@ -207,7 +216,6 @@ def shard_moe(
     # guarded import
     from megablocks.layers import moe, dmoe, arguments, mpu
     from megablocks.layers import dmlp_registry
-    from .tpmoe import TpMoE
 
     assert ep_size > 1, "this function is used for sharding moe" 
 
@@ -242,7 +250,6 @@ def shard_moe(
     mp_dmoe_args = arguments.Arguments(
         **moe_kwargs, device=device,
         expert_parallel_group=device_mesh[key_ep].get_group(0)
-        
     )
 
     assert mp_dmoe_args.moe_num_experts % world_size == 0, \
@@ -277,7 +284,7 @@ def shard_moe(
             found.items(), 
             disable=torch.distributed.get_rank() > 0,
             desc=(
-                'Sharding MoE (TP)' if not parallize_tensor
+                'Sharding MoE (TP)' if parallize_tensor
                 else 'Sharding MoE (EP)'
             )
         ):
@@ -288,6 +295,10 @@ def shard_moe(
                 if not parallize_tensor:
                     mp_dmoe = dmoe.dMoE(mp_dmoe_args) # drop in replacement for now
                 else:
+                    # in the TP case, we wil use moe.MoE instead
+                    # - we will update moe_kwargs to set moe_expert_model_parallelism=False
+                    #   this is so that forward_once will be called instead of parallel_forward_once
+                    # - we need to accurately set ffn_hidden_size after the TP sharding by ep_size
                     mp_dmoe = moe.MoE(mp_dmoe_args)
                     exp = mp_dmoe.experts
                     exp.hidden_size = mp_dmoe_args.hidden_size

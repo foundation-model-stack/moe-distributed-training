@@ -60,6 +60,14 @@ def get_mlp_weights_lora(mod: torch.nn.Module, name: str = "w1"):
 
     return (W, A, B, r, lora_alp)
 
+def get_mlp_device_mesh_pg(mod: torch.nn.Module):
+    # just use one of the weights to get the device
+    device_mesh = mod.mlp.w1.device_mesh
+    # NOTE: this API has changed since 2.4
+    grps = device_mesh.get_group()
+    # return the last dimension, we assume thas the one used for experts
+    return grps[-1] 
+
 def update_mlp_registry():
     # patch the registry to point to our v2
     _REGISTRY['mlp']['sparse'] = SparseMLPv2
@@ -99,6 +107,10 @@ def update_mlp_registry():
         expert_capactiy,
         top_k,
     ):
+        # NOTE: in what follows below
+        # - moe_expert_model_parallelism=True: megablocks-style where experts are Shard
+        # - moe_expert_model_parallelism=False: tensor-parallel
+
         with torch.no_grad():
             # num_experts if from ParallelMLP
             padded_block_idxs, expert_offsets = scattermoe.kernels.ops.padded_block_indices(
@@ -137,7 +149,10 @@ def update_mlp_registry():
             grouped_out=True,
         )
         hidden_states = F.silu(hidden_states) * hidden_states2
-        return scattered_experts(
+
+        # NOTE: for TP we set grouped_out=False, because we rely on the 
+        # megablocks.ops.scatter call to compute the expert weights, see below
+        hidden_states = scattered_experts(
             hidden_states,
             *get_weights(self, "w2"),
             1,
@@ -147,8 +162,28 @@ def update_mlp_registry():
             expert_offsets,
             gates=None, # we dont have router weights
             grouped_in=True,
-            grouped_out=False,
+            grouped_out=False if self.args.moe_expert_model_parallelism else True
         )
+
+        if not self.args.moe_expert_model_parallelism:
+            # in the get_weights call we had called "to_local" 
+            # to pass to kernels. So we need to manually reduce when doing 
+            # tensor parallel.
+            # 1. One way is to covert DTensor.from_local(..., placements=[_Partial()]), then 
+            #    .redistribute(placements=[Replicate()]) and then .to_local()
+            # 2. The other way is to just call `dist.all_reduce` manually.
+
+            # We opt for step 2. We dont have to worry about the backward since
+            # the jacobian of all_reduce is 1. However they will issue a warning
+            # UserWarning: c10d::allreduce_: an autograd kernel was not registered to the Autograd key(s) but we are trying to backprop through it.
+
+            torch.distributed.all_reduce(
+                hidden_states,
+                group=get_mlp_device_mesh_pg(self),
+                op=torch.distributed.ReduceOp.SUM
+            )
+        return hidden_states
+
 
     def permute_and_compute(
         self,
@@ -189,13 +224,14 @@ def update_mlp_registry():
     # - we need to overide it with the above permute and compute
     # - the "dmoe" version of parallel and compute has the 
     #   binned gather and scatter done outside
-    # - this needs to reduce the expert weights
+    # - this also needs to reduce the expert weights which is done 
+    #   in the scatter call
     def permute_and_compute_parallel_mlp(
         self,
         x,
-        tokens_per_expert,  # unused
+        tokens_per_expert,  
         indices,
-        bin_ids,  # unused
+        bin_ids,  
         expert_weights,
         bins,
         expert_capacity,
@@ -210,13 +246,11 @@ def update_mlp_registry():
             self, x, tokens_per_expert, indices,
             bin_ids, expert_weights, bins, expert_capacity, top_k
         )
-        # following
-        # https://github.com/IBM/dolomite-engine/blob/b3ad5703ae32060f07339b664d3caca3e2c5e70a/dolomite_engine/hf_models/models/moe_dolomite/moe/base.py
 
+        # - the scatter call will reduce the expert weights
         return ops.scatter(x, indices, bin_ids, expert_weights, bins, top_k)
 
     ParallelMLP.permute_and_compute = permute_and_compute_parallel_mlp
-    # ParallelMLP.permute_and_compute = permute_and_compute
 
     def forward_router(self, x):
         if self.training and self.args.moe_jitter_eps is not None:

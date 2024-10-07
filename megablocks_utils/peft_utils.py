@@ -1,7 +1,7 @@
 
 import torch
 from peft.tuners.lora import LoraLayer
-from torch.distributed._tensor import Placement, Replicate, Shard, distribute_tensor
+from torch.distributed._tensor import Replicate, Shard, distribute_tensor
 from megablocks.layers import mpu
 from typing import Union, Any
 
@@ -43,12 +43,8 @@ class ParallelDroplessMLP(torch.nn.Module, LoraLayer):
         device_mesh = ARTIFACTS.get('device_mesh')
         ep_degree = 1
         if device_mesh is not None:
-            # for A and B, of size ff_dim x hidd
-            # placements = (
-            #     [Shard(0)] + 
-            #     [Replicate() for _ in range(device_mesh.ndim-1)]
-            # )
-            _, ep_degree = device_mesh.shape
+            # NOTE: change Shard to Partial when upgrading to torch >= 2.4
+            ep_degree = device_mesh.shape[-1]
             placements = [Replicate(), Shard(0)]
 
         base_layer._lora_pointers = {}
@@ -92,8 +88,7 @@ class ParallelDroplessMLP(torch.nn.Module, LoraLayer):
                     A, 'weight', 
                     torch.nn.Parameter(
                         distribute_tensor(
-                            # weight.repeat(num_experts, 1), 
-                            weight.repeat(ep_degree, 1), 
+                            weight.repeat(ep_degree, 1), # workaround
                             device_mesh,
                             placements
                         ),
@@ -117,8 +112,7 @@ class ParallelDroplessMLP(torch.nn.Module, LoraLayer):
                     B, 'weight', 
                     torch.nn.Parameter(
                         distribute_tensor(
-                            # weight.repeat(num_experts, 1), 
-                            weight.repeat(ep_degree, 1), 
+                            weight.repeat(ep_degree, 1),  # work around
                             device_mesh,
                             placements
                         ),
@@ -179,18 +173,13 @@ class ParallelMLP(torch.nn.Module, LoraLayer):
                 "A": [Replicate(), Replicate()],
                 "B": [Replicate(), Shard(0)],
             } 
-            _, ep_degree = device_mesh.shape
-            # placements = (
-            #     [Shard(0)] + 
-            #     [Replicate() for _ in range(device_mesh.ndim-1)]
-            # )
-            # placements = [Replicate(), Shard(0)]
+            # NOTE: change Shard to Partial when upgrading to torch 2.4
+            ep_degree = device_mesh.shape[-1] # assume its the last
 
         # we need to it cover the base layer
         # - this will have A to be size (k, hd)
         # - this will have B to be size (ffn, k)
         self.in_features = base_layer.hidden_size * num_experts
-        # self.out_features = base_layer.ffn_hidden_size * num_experts // ep_degree
         self.out_features = base_layer.ffn_hidden_size * num_experts
 
         base_layer._lora_pointers = {}
@@ -234,7 +223,6 @@ class ParallelMLP(torch.nn.Module, LoraLayer):
                     A, 'weight', 
                     torch.nn.Parameter(
                         distribute_tensor(
-                            # weight.repeat(ep_degree, 1), 
                             weight,
                             device_mesh,
                             placements["A"]
@@ -259,7 +247,7 @@ class ParallelMLP(torch.nn.Module, LoraLayer):
                     B, 'weight', 
                     torch.nn.Parameter(
                         distribute_tensor(
-                            weight.repeat(ep_degree, 1), 
+                            weight.repeat(ep_degree, 1),  # workaround
                             device_mesh,
                             placements["B"]
                         ),
@@ -275,7 +263,6 @@ class ParallelMLP(torch.nn.Module, LoraLayer):
                 name
             ] = (
                 A.weight, B.weight, r, alpha,
-                # base_layer.hidden_size, base_layer.ffn_hidden_size // ep_degree,
                 base_layer.hidden_size, base_layer.ffn_hidden_size
             )
     
