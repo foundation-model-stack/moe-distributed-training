@@ -22,17 +22,24 @@ In the data parallel dimension, seperate shards (stylised as white and grey in t
 
 The key assumption here is that within a single data example (or batch) **the tokens assigned to each expert is roughly the same**, so each device will run in parallel for approximately the same amount of time, then moving on to the next batch. 
 - The challenge is to then manage slight differences in token numbers without dropping them; this is addressed by the `DroplessMoE` in megablocks using sparse matmuls.
+- for [train_accelerate_fsdp2.py](./train_accelerate_fsdp2.py) there is a choice for running scattermoe in place of the megablock kernels when passing `use_scattermoe=True`. 
+
 
 ### Performance
 
 Expert parallel will be able to achieve increased throughputs if the number of tokens to each expert are well-balanced.
 
 
-Emb, Attn | MoE | train_runtime (s) | train_steps_per_sec | gpu_mem_used_peak (MiB)
---|--|--|--|--
-FSDP2 | FSDP2 | 12345 | 0.033 | 54163
-FSDP2 | megablocks | 3478 | 0.117 | 46692
-
+Type | ep_size | Emb, Attn | MoE | train_runtime (s) | gpu_mem_used_peak (MiB) | gpu_mem_alloc (MiB)
+--|--|--|--|--|--|--
+Full | no parallel | FSDP2 | FSDP2 | 3037 | 59 | 47
+Full | 8 | FSDP2 | megablocks | 871 | 49 | 36
+Full | 4 | FSDP2 | megablocks | OOM  | OOM | OOM
+LoRA (16, attn) | no parallel | FSDP2 | FSDP2 | 2137 | 22 | 12
+LoRA (16, attn) | 8 | FSDP2 | megablocks | 878 | 14 | 12
+LoRA (16, attn) | 4 | FSDP2 | megablocks | 878 | 26 | 25
+LoRA (16, attn) | 4 | FSDP2 | **scatterblocks** | **831** | **25** | **24**
+LoRA (16, **all**) | 4 | FSDP2 | **scatterblocks** | 880 | 26 | 25
 
 
 ## Running
@@ -41,6 +48,8 @@ Install dependencies (will require CUDA_TOOLKIT to build megablocks):
 ```
 pip install -r requirements.txt
 ```
+
+### Full Finetuning
 
 Running FSDP1 script uses accelerate. The equivalent run to above would be 
 - [`accelerate.yaml`](./accelerate.yaml) are the launcher defaults.
@@ -81,6 +90,28 @@ torchrun --nproc_per_node=8 \
 	--use_megablocks_sharding True \
 	--debug True \
 	--learning_rate 5e-5
+```
+
+
+ Use [scattermoe](https://github.com/shawntan/scattermoe) instead of megablocks kernels to handle the DroplessMoe.   
+For `scattermoe` (in full-finetuning):
+- set `use_scattermoe` to `True`.
+
+
+### LoRA Finetuning
+
+This can be done with the following additional flags:
+- `use_lora`: set as
+    * `none`: (default). No adapters.
+    * `all`: adapters on both attention and mlp.
+    * `attn-only`: adapters only on attention.
+ - `use_scattermoe`: For `all` and `mlp-only`, this must be set to `True`; only scattermoe kernels support LoRA (the megablocks kernels do not).
+
+### Running Tests
+
+Make sure to set the path:
+```
+PYTHONPATH=. pytest tests
 ```
 
 

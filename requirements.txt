@@ -10,3 +10,5 @@ tqdm
 fire
 
 peft
+
+pytest # for tests

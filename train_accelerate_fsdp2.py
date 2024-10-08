@@ -52,6 +52,8 @@ def main(
     per_device_train_batch_size: int = 1,
     gradient_accumulation_steps: int = 1,
     use_megablocks_sharding: bool = False,
+    use_scattermoe: bool = False,
+    use_tp_sharding: bool = False,
     lr_scheduler_type: str = 'linear',
     num_epochs: int = 1,
     num_warmup_steps: int = 0,
@@ -59,7 +61,7 @@ def main(
     learning_rate: float = 1e-5,
     truncate_model_for_debug: bool = False,
     expert_degree: int = None,
-    use_lora: bool = False,
+    use_lora: str = "none", # attn-only #all
 ):
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -112,11 +114,30 @@ def main(
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
 
-    if use_megablocks_sharding:
+    if use_scattermoe and not (use_megablocks_sharding or use_tp_sharding):
+        raise ValueError(
+            "use_scatter_moe==True only works if performing "
+            "megablocks sharding or tp sharding."
+        )
+
+    if use_megablocks_sharding or use_tp_sharding:
 
         if expert_degree is None:
             expert_degree = world_size
 
+        if use_scattermoe:
+            try:
+                import scattermoe
+            except ImportError:
+                raise ValueError(
+                    "use_scattermoe=True but scattermoe not installed. "
+                    "pip install -r requirements-scattermoe.txt"
+                )
+
+        assert use_megablocks_sharding + use_tp_sharding == 1, \
+            "must choose between megabocks or tp_sharding"
+
+        # if use_megablocks_sharding:
         device_mesh = shard_moe(
             model, 
             MixtralSparseMoeBlock, 
@@ -129,8 +150,15 @@ def main(
                 has_bias=False,
                 fp16=(load_model_dtype == 'float16'),
                 bf16=(load_model_dtype == 'bfloat16'),
+                mlp_impl=(
+                    "sparse" if not use_scattermoe else
+                    "scattermoe"
+                ),
+                use_tensor_parallelism=use_tp_sharding,
             ),
+            parallize_tensor=use_tp_sharding
         )
+        # elif use_tp_sharding:
 
         # NOTE: this is a hack to hve the FSDP fully_shard ignore the MoE 
         # module, whilst sharding the attention module.
@@ -141,10 +169,14 @@ def main(
             setattr(
                 layer.block_sparse_moe, REGISTRY_KEY, {'replicate'}
             )
+    elif use_tp_sharding:
+        assert expert_degree is not None, "for tp sharding please expert degree < world_size"
+
+        
     else:
         device_mesh = init_device_mesh(
             "cuda", 
-            (world_size,), mesh_dim_names=('dp', )
+            (world_size,), mesh_dim_names=('data_parallel', )
         )
 
     mp_policy = MixedPrecisionPolicy(
@@ -160,7 +192,7 @@ def main(
     # - we cannot use accelerate's prepare model because there is no 
     #   FSDP2 integration yet
     def prepare_model(m: torch.nn.Module):
-        if not use_lora:
+        if use_lora == "none":
             layers = m.model.layers
         else:
             layers = m.get_base_model().model.layers
@@ -206,19 +238,80 @@ def main(
         )
         return m
 
-    if use_lora:
+    # no stringent value checks, please set carefully
+    if use_lora != "none":
+
+        # target modules set if use_lora == "all" or "attn-only"
+        if use_lora in {'all', 'attn-only'}:
+            tm = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        else:
+            tm = []
+
+        # if we are not doing megablocks sharding
+        if (
+            not use_megablocks_sharding and  
+            use_lora in {"all", "mlp-only"} # if need adapters
+        ):
+            # add these extra here 
+            tm += ["w1", "w2", "w3"]
+
+
         peft_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=16,
             lora_alpha=16,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.0, # for now do not support dropout
+            bias="none",
+            target_modules=tm,
         )
+
+        if (
+            (use_megablocks_sharding or use_tp_sharding)
+            and use_lora in {'all', 'mlp-only'}
+        ):
+            assert use_scattermoe, "lora adapters cannot be used on MLP without scattermoe"
+
+            from megablocks.layers.moe import ParallelMLP
+            from megablocks.layers.dmoe import ParallelDroplessMLP
+            from megablocks_utils.peft_utils import ParallelDroplessMLP as LoRAParallelDroplessMLP, ARTIFACTS
+            from megablocks_utils.peft_utils import ParallelMLP as LoRADroplessMLP
+
+            # inject this so we can replicate
+            ARTIFACTS['device_mesh'] = device_mesh
+
+            # inject a custom module for MLP since SparseMLP is not 
+            # a supported class
+            peft_config._register_custom_module({
+                ParallelDroplessMLP: LoRAParallelDroplessMLP,
+                ParallelMLP: LoRADroplessMLP,
+            })
+            
+            peft_config.target_modules.add("experts")
+
+        # NOTE: since this is done before prepare model
+        # - since we REGISTRY_KEY='replicate" for the moe above, we ignore any
+        #   FSDP2 sharding for the moe
+        # - for the case use_megablocks_sharding this is ok, since the adapters for each
+        #   shard is seperate
+        # - however for use_tp_sharding the adapter gradients will not be 
+        #   reduced, and it is currently not accurate. TODO: add some ocde
+        #   to reduce the adapter weights for this case
         model = prepare_peft(
             model, peft_config, 
             gradient_checkpointing=True,
             bf16=(load_model_dtype=='bfloat16'),
             autocast_adapter_dtype=False, # do not upcast because FSDP cannot handle mixed types
         )
+
+        # FIXME: its abit problemantic to use different adapter
+        # names, so we do this manually
+        if use_scattermoe and use_lora in {'all', 'mlp-only'}:
+            # - after the PEFT prepare we have to force the parameters
+            # back to require_grad = True
+            # - lora has no bias
+           for name, p in model.named_parameters():
+               if "experts" in name and 'lora_' in name:
+                   p.requires_grad = True
 
     # prepare the model without accelerate
     model = prepare_model(model)
@@ -246,9 +339,47 @@ def main(
     )
 
     # - prepare for distributed training 
-    dataloader, optimizer, scheduler = accelerator.prepare(
-        dataloader, optimizer, scheduler
-    )
+    if not use_tp_sharding:
+        dataloader, optimizer, scheduler = accelerator.prepare(
+            dataloader, optimizer, scheduler
+        )
+    else:
+        # need to check 
+        dp_mesh = device_mesh["data_parallel"]
+        dp_num_processes, dp_process_index = dp_mesh.size(), dp_mesh.get_local_rank()
+        num_processes = accelerator.num_processes
+
+        # redo the scheduler to scale up the number of train steps
+        # - have to do this because having trouble configuring accelerator
+        scheduler = get_scheduler(
+            lr_scheduler_type,
+            optimizer=optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=(
+                len(dataloader) * (num_processes / dp_num_processes) // 
+                gradient_accumulation_steps * num_epochs
+            ),
+        )
+        optimizer, scheduler = accelerator.prepare(
+            optimizer, scheduler
+        )
+
+        from accelerate.data_loader import prepare_data_loader
+        dataloader = prepare_data_loader(
+            dataloader, 
+            accelerator.device,
+            num_processes=dp_num_processes,
+            process_index=dp_process_index,
+            split_batches=accelerator.split_batches,
+            put_on_device=True,
+            rng_types=accelerator.rng_types.copy(),
+            dispatch_batches=accelerator.dispatch_batches,
+            even_batches=accelerator.even_batches,
+            # slice_fn_for_dispatch=slice_fn_for_dispatch,
+            use_seedable_sampler=accelerator.use_seedable_sampler,
+            non_blocking=accelerator.non_blocking,
+            use_stateful_dataloader=accelerator.use_stateful_dataloader,
+        )
 
     # after prepare compute these (note the dataloader length will change here)
     num_update_steps_per_epoch = len(dataloader) // gradient_accumulation_steps
@@ -293,14 +424,17 @@ def main(
                 tr_loss += loss.item() / gradient_accumulation_steps
 
                 if accelerator.sync_gradients:
-                    _grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                     try:
+
+                        # NOTE: known issue that grad norm is not matching
+                        # for the TP case
+                        _grad_norm = accelerator.clip_grad_norm_(model.parameters(), max_grad_norm)
                         # if its a DTensor we need to do this
                         _grad_norm = _grad_norm.to_local()
+                        _grad_norm = _grad_norm.item()
                     except:
-                        pass
+                        _grad_norm = 0.
 
-                    _grad_norm = _grad_norm.item()
 
                 if (
                     step > 0 and
