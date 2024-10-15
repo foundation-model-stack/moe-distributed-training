@@ -1,19 +1,4 @@
-from collections import defaultdict
-from contextlib import ExitStack
-from copy import copy
-from typing import Dict, List, Tuple, Type, Union
-import json
-import os
-import re
-import warnings
-
 # Third Party
-from accelerate import init_empty_weights
-from safetensors import safe_open
-from torch.distributed._tensor import Placement, Replicate, Shard, distribute_tensor, Partial
-from torch.distributed._tensor.device_mesh import DeviceMesh, init_device_mesh
-from tqdm import tqdm
-from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 import torch
 import torch.nn.functional as F
@@ -50,7 +35,7 @@ class ScatteredExperts(torch.nn.Module):
     ):
         super().__init__()
         self.weight = torch.nn.Parameter(
-            torch.empty(num_experts, in_features, out_features),
+            torch.empty(num_experts, in_features, out_features, dtype=torch.bfloat16),
             requires_grad=True,
         )
         self.fan_out = fan_out
@@ -61,9 +46,9 @@ class ScatteredExperts(torch.nn.Module):
         self, x, bin_ids, indices, padded_block_idxs, 
         expert_offsets, gates=None,
     ):
-        return parallel_linear(
+        return scattered_experts(
             x,
-            self.weight,
+            self.weight.to_local(),
             # 1 if self.args.moe_expert_model_parallelism else self.fan_out,
             self.fan_out,
             bin_ids, # sorted_expert_idxs,
@@ -139,65 +124,17 @@ class ScatterMoE(torch.nn.Module):
             # grouped_out=False if self.args.moe_expert_model_parallelism else True
         )
 
-    # def add_expert(self, key, weight, bias=False):
-
-    #     assert bias == False, "dunno how to handle bias"
-    #     assert len(weight.shape) == 3, "only know how to handle dim 3"
-
-    #     if weight.shape[-1] == self.intermediate_size:
-    #         self.col_linears[key] = ScatteredExperts(
-    #             in_features=self.hidden_size,
-    #             out_features=self.intermediate_size,
-    #             num_experts=self.num_experts,
-    #             fan_out=self.top_k if not self.all_to_all else 1,
-    #             grouped_out=True,
-    #         )
-    #     elif weight.shape[-2] == self.intermediate_size:
-    #         self.row_linears[key] = ScatteredExperts(
-    #             in_features=self.intermediate_size,
-    #             out_features=self.hidden_size,
-    #             num_experts=self.num_experts,
-    #             fan_out=self.top_k if not self.all_to_all else 1,
-    #             grouped_in=True,
-    #             # grouped_out=False if self.args.moe_expert_model_parallelism else True
-    #         )
-    #     else:
-    #         raise NotImplementedError
-
-    # from dolomite / granite
-    # def _routing(self, hidden_states):
-    #     # compute the top_k routing decision
-    #     logits = self.layer(hidden_states).float()  # [batch_size x seq_len, num_experts]
-    #     top_k_logits, top_k_indices = logits.topk(self.top_k, dim=1)  # [num_tokens, top_k]
-    #     top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)  # [num_tokens, top_k]
-
-    #     # compute number of input given to each expert
-    #     zeros = torch.zeros(
-    #         [top_k_gates.size(0), self.num_experts], dtype=top_k_gates.dtype, device=top_k_gates.device
-    #     )  # [num_tokens, num_experts]
-    #     gates = zeros.scatter(1, top_k_indices, 1)  # [num_tokens, num_experts]
-    #     expert_size = gates.long().sum(0)  # [num_experts,]
-    #     expert_size = expert_size.tolist()
-
-    #     # sort and group input tokens according to expert assignment
-    #     top_k_experts = top_k_indices.flatten()  # [num_tokens * top_k]
-    #     _, index_sorted_experts = top_k_experts.sort(0)  # [num_tokens * top_k]
-    #     batch_index = index_sorted_experts.div(self.top_k, rounding_mode="trunc")  # [num_tokens * top_k]
-
-    #     # gather the gate values for grouped input tokens
-    #     top_k_gates = top_k_gates.flatten()  # [num_tokens * top_k]
-    #     batch_gates = top_k_gates[index_sorted_experts]  # [num_tokens * top_k]
-
-    #     return index_sorted_experts, batch_index, batch_gates, expert_size, logits
-
+    # def add_expert(self, key, 
     # dolomite, MoE_Torch
     def _compute_routing_weights(self, hidden_states):
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        if self.training and self.jitter_noise > 0:
-            hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        # batch_size, sequence_length, hidden_dim = hidden_states.shape
+        # if self.training and self.jitter_noise > 0:
+        #     hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
+        # hidden_states = hidden_states.view(-1, hidden_dim)
+
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
+        router_logits = F.linear(hidden_states, self.router.weight.to_local(), bias=None)
+        # router_logits = self.router(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -224,7 +161,7 @@ class ScatterMoE(torch.nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
         # _, batch_index, batch_gates, expert_size, router_logits = self.router(layer_input)
-        router_logits, routing_weights, selected_experts = self._routing(hidden_states)
+        router_logits, routing_weights, selected_experts = self._compute_routing_weights(hidden_states)
 
         sorted_expert_idxs, sorted_scattered_idxs = self._maybe_gather(selected_experts)
 

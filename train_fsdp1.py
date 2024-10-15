@@ -4,7 +4,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 from transformers import TrainingArguments
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import torch
-from megablocks_utils.shard_moe_utils import shard_moe, get_moe_kwargs
+# from megablocks_utils.shard_moe_utils import shard_moe, get_moe_kwargs
+from hf_utils.shard_moe_utils import shard_moe
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 from megablocks_utils.config_utils import update_mlp_registry
 
@@ -82,13 +83,13 @@ def main(
             checkpoint_name_or_path=MODEL_NAME,
             rank=torch.distributed.get_rank(),
             world_size=torch.distributed.get_world_size(),
-            ep_size=torch.distributed.get_world_size(),
-            moe_kwargs=get_moe_kwargs(
-                model.config, 
-                has_bias=False,
-                fp16=training_args.fp16,
-                bf16=training_args.bf16,
-            ),
+            ep_degree=torch.distributed.get_world_size(),
+            # moe_kwargs=get_moe_kwargs(
+            #     model.config, 
+            #     has_bias=False,
+            #     fp16=training_args.fp16,
+            #     bf16=training_args.bf16,
+            # ),
         )
 
         trainer.accelerator.state.fsdp_plugin.ignored_modules = [

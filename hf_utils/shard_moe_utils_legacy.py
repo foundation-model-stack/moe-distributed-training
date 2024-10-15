@@ -39,8 +39,8 @@ KEY_EXPERT_PARALLEL = "expert_parallel"
 DIM_EXPERT = 0
 
 # these depend on the namings in the dMOE
-KEY_DMOE_ROUTER = "router.layer.weight"
-KEY_DMOE_EXPERTS = "experts.mlp"
+# KEY_DMOE_ROUTER = "router.layer.weight"
+# K#EY_DMOE_EXPERTS = "experts.mlp"
 
 
 def get_moe_kwargs(
@@ -92,7 +92,7 @@ def get_resolved_checkpoint_location(model_name_or_path: str):
 # Example: if prefix="module.layers.0" and instance_name="block_sparse_moe", then a dictionary
 # of the following will be returned:
 # {
-#   'experts.mlp.w1': [
+#   'w1.weight': [
 #      (
 #        'model.layers.0.block_sparse_moe.experts.0.w1.weight',
 #        'model-00001-of-00019.safetensors'
@@ -103,21 +103,41 @@ def get_resolved_checkpoint_location(model_name_or_path: str):
 #      ),
 #      ...
 #    ]
-#    'experts.mlp.w2': [...],
-#    'experts.mlp.w3': [...],
-#    'router.layer.weight': [
+#    'w2.weight': [...],
+#    'w3.weight': [...],
+#    'router.weight': [
 #       (
 #          'model.layers.0.block_sparse_moe.gate.weight',
 #          'model-00001-of-00019.safetensors'
 #       )
 #     ]
 # }
+# 
+# or the non-sharded case (and possibly fused case)
+# {
+#   'w1.weight': [
+#      (
+#        'model.layers.0.block_sparse_moe.input_linear.layer.weight',
+#        'model-00001-of-00001.safetensors'
+#      ),
+#    ],
+#    ...
+#   'w3.weight': [
+#      (
+#        'model.layers.0.block_sparse_moe.input_linear.layer.weight',
+#        'model-00001-of-00001.safetensors'
+#      ),
+#    ]
+# }
+
+
 def get_checkpoint_meta_from_sharded_safetensor(
     weight_map: Dict,
     prefix: str,  # e.g., 'model.layers.0,
     instance_name: str,  # e.g., block_sparse_moe
     router_name: str = "gate",  # e.g., named "gate" within block_sparse_moe
     expert_name: str = "experts",  # e.g., named "experts" within block_sparse_moe
+    expert_map: Dict = None, # map -> [w1,w2,w3]
 ) -> Dict[str, List[Tuple]]:
     # insert in order
     def _insert(L: List, i: int, v):
@@ -132,9 +152,27 @@ def get_checkpoint_meta_from_sharded_safetensor(
             n -= 1
         L[i] = v
 
+    # if expert_name = input_linear|output_linear|input_linear
+    # - in this case will map 
+    # - input_linear: [w1, w3], output_linear: {w2}
+    # - will assume the latter has double the size and can
+    #   be split.
+    if expert_map is None:
+        if '|' in expert_name:
+            expert_map = {}
+            _names = expert_name.split('|')
+            assert len(_names) in {2,3}, "expert name map has to be length 2/3"
+            
+            for i, n in enumerate(_names):
+                if n not in expert_map:
+                    expert_map[n] = []
+                expert_map[n].append(f'w{i+1}')
+        else:
+            expert_map = {x: [x] for x in ['w1', 'w2', 'w3']}
+
     # state dict -> weights
-    # 'router.layer.weight': [(k, file),...]
-    # `experts.mlp.w1`: [...]
+    # 'router.weight': [(k, file),...]
+    # `w1.weight`: [...]
     _map = defaultdict(list)
     prefix = f"{prefix}.{instance_name}."
     for k, stfile in weight_map.items():
@@ -153,11 +191,19 @@ def get_checkpoint_meta_from_sharded_safetensor(
                 f"'{router_name}' or expert_name '{expert_name}'"
             )
         if m.group(1) == router_name:
-            _map[KEY_DMOE_ROUTER].append((k, stfile))
-        elif m.group(1) == expert_name:
+            _map["router.weight"].append((k, stfile))
+        elif m.group(1) in expert_name:
             index = int(m.group(2))
-            mod = m.group(3)
-            _insert(_map[f"{KEY_DMOE_EXPERTS}.{mod}"], index, (k, stfile))
+            mod = None
+            for mod in expert_map.get(m.group(1), expert_map.get(m.group(3))):
+                _insert(_map[f"{mod}.weight"], index, (k, stfile))
+
+            assert mod is not None, f"cannot map \'{rel_k}\'"
+        # else:
+        #     # might need a another clause if it not sharded type
+        #     # - or maybe not, just let it return 
+        #     # "w1.weight: [(k,fi), ...]"
+        #     pass
 
     if len(_map) == 0:
         raise ValueError(
