@@ -37,53 +37,68 @@ KEY_REPLICATE = "data_parallel"
 KEY_EXPERT_PARALLEL = "expert_parallel"
 DIM_EXPERT = 0
 
-# these depend on the namings in the dMOE
-KEY_DMOE_ROUTER = "router.layer.weight"
-KEY_DMOE_EXPERTS = "experts.mlp"
+# class ScatterMoe(torch.nn.Module):
+# 
+#     def __init__(
+#         self, 
+#         hidden_size: int,
+#         intermediate_size: int,
+#         num_experts: int,
+#         **kwargs,
+#     ):
+#         super().__init__()
+#         self.hidden_size = hidden_size
+#         self.intermediate_size = intermediate_size
+#         self.num_experts = num_experts
+#         self._kwargs = kwargs
+# 
+#     def _init_parameters(self):
+#         raise NotImplementedError
 
-class ScatterExperts(torch.nn.Module):
-
-    def __init__(self, config, ):
-        pass
-
-
-def build_experts_forward(
-    expert_module: torch.nn.ModuleList, # the expert module
-    ff_dim: int,
-    rank: int,
-    world_size: int,
-    device_mesh: DeviceMesh,
-    ep_degree: int = 1,
-):
-
-    # gather up all the shard
-    state_dict = defaultdict(list)
-    _ep_mesh = device_mesh[KEY_EXPERT_PARALLEL]
-    _num_processes = _ep_mesh.size()
-    _lr = _ep_mesh.get_local_rank()
-    for i in range(_lr * ep_degree, (_lr + 1) * ep_degree):
-        for param_name, param in expert_module[i].named_parameters():
-            state_dict[param_name].append(
-                param if param.shape[0] > param.shape[1] else param.T
-            )
-
-    state_dict = {k: torch.concat(ps) for k, ps in state_dict.items()}
-
-    def _forward(self, hidden_states):
-        pass
-
-    return _forward
+# def extract_experts_module_list(
+#     expert_module: torch.nn.ModuleList, # the expert module
+#     ff_dim: int,
+#     rank: int,
+#     world_size: int,
+#     device_mesh: DeviceMesh,
+#     ep_degree: int = 1,
+# ):
+# 
+#     # gather up all the shard
+#     state_dict = defaultdict(list)
+#     _ep_mesh = device_mesh[KEY_EXPERT_PARALLEL]
+#     _num_processes = _ep_mesh.size()
+#     _lr = _ep_mesh.get_local_rank()
+#     for i in range(_lr * ep_degree, (_lr + 1) * ep_degree):
+#         for param_name, param in expert_module[i].named_parameters():
+#             # state_dict[param_name].append(
+#             #     param if param.shape[0] > param.shape[1] else param.T
+#             # )
+#             assert len(param.shape) == 2, "unsupported shape"
+#             if param.shape[0] != ff_dim:
+#                 param = param.T
+#             param.unsqueeze(0)
+# 
+#     state_dict = {k: torch.concat(ps) for k, ps in state_dict.items()}
+# 
+     
+from .shard_moe_utils_legacy import (
+    get_resolved_checkpoint_location,
+    get_checkpoint_meta_from_sharded_safetensor
+)
+from .scattermoe import ScatterMoE
 
 def shard_moe(
     model: torch.nn.Module,
     moe_cls: Union[str, Type],
+    checkpoint_name_or_path: str,
     rank: int,
     world_size: int,
     device_type: str = "cuda",
     key_rep: str = KEY_REPLICATE,
     key_ep: str = KEY_EXPERT_PARALLEL,
     router_name: str = "gate",
-    expert_name: str = "experts",
+    expert_name: str = "experts", # can be regex with |
     ep_degree: int = 1,
     mixed_precision: bool = False,
 ):
@@ -122,6 +137,8 @@ def shard_moe(
         f"number of moe experts ({moe_num_experts}) "
         f"not divisible by ep_size ({ep_degree})."
     )
+
+    num_experts_per_device = moe_num_experts // ep_degree
 
     # for all the MoE related params, e.g., gate, experts
     # get a dictionary
@@ -167,12 +184,23 @@ def shard_moe(
                 index["weight_map"], prefix, module_name, router_name, expert_name
             )
 
-            _args = copy(mp_dmoe_args)
-            _args.bias = has_bias
+            # _args = copy(mp_dmoe_args)
+            # _args.bias = has_bias
 
             # - will replace the MoE module with the megablocks sharded dMoE
+            # - very hard to do patching, settle for module swap
+            #   for now
+            # - assumption, router will just use a nn.Linear with topk
             with init_empty_weights():
-                mp_dmoe = dmoe.dMoE(_args)  # drop in replacement for now
+                mp_dmoe = ScatterMoE(
+                    hidden_size=model.config.hidden_size,
+                    hidden_act=model.config.hidden_act,
+                    intermediate_size=model.config.intermediate_size,
+                    num_experts=num_experts_per_device,
+                    has_bias=has_bias
+                    dtype=model.dtype,
+                    device=device,
+                )  # 
 
             load_sharded_experts_onto_device(
                 mp_dmoe,
@@ -195,4 +223,4 @@ def shard_moe(
             "Currently only support non-GGUF safetensor checkpoints. "
         ) from e
 
-    return device_mesh[key_rep], moe_module_names
+    return device_mesh[key_dp], moe_module_names
