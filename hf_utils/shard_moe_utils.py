@@ -63,6 +63,7 @@ def load_sharded_experts_onto_device(
     mixed_precision: bool = False,
 ):
 
+    rep_size = device_mesh[KEY_REPLICATE].size()
     ep_mesh = device_mesh[KEY_EXPERT_PARALLEL]
     ep_process_index = ep_mesh.get_local_rank()
 
@@ -116,12 +117,14 @@ def load_sharded_experts_onto_device(
                     data.append(T)
 
                 param = torch.concat(data, dim=DIM_EXPERT)
-                # _placements = [Replicate(), _Partial(0)]
                 _placements = None
-                param = DTensor.from_local(
-                    param, device_mesh=device_mesh, 
-                    placements=[Replicate(), Shard(0)]
-                )
+                if rep_size == 1:
+                    param = param.to('cuda')
+                else:
+                    param = DTensor.from_local(
+                        param, device_mesh=device_mesh, 
+                        placements=[Replicate(), Shard(0)]
+                    )
 
             # get the module we want to shard
             name = weight_name.split(".")
