@@ -85,18 +85,16 @@ def load_sharded_experts_onto_device(
         for weight_name, vs in checkpoint_metadata.items():
 
             if KEY_SCATTERMOE_ROUTER in weight_name:
+                k, fi = vs[0] # only one item
                 param = files[fi].get_tensor(k)
                 _placements = [Replicate(), Replicate()]
 
             elif len(vs) == 1:
+                k, fi = vs[0] # only one item
                 # if its a non-router weight and its non-sharded
                 param = files[fi].get_tensor(k)
                 # NOTE: check for num_experts
                 assert len(param.shape) == 3, "wrong shape for non-sharded expert"
-                # param = param[
-                #     ep_process_index*ep_num_processes:
-                #     (ep_process_index+1)*ep_num_processes
-                # ]
                 _placements = [Replicate(), Shard(0)]
             else:
                 # handle sharding if the checkpoint shards experts
@@ -110,10 +108,11 @@ def load_sharded_experts_onto_device(
                     )
                 ]:
                     T = files[fi].get_tensor(k)
+                    assert len(T.shape) == 2, "wrong shape"
+                    if k.endswith('weight'):
+                        T = T.T # then its from a linear
+
                     T = T.unsqueeze(0)
-                    # if expert_name in k and k.endswith("weight"):
-                    #     if T.shape[1] > T.shape[0]:
-                    #         T = T.t()
                     data.append(T)
 
                 param = torch.concat(data, dim=DIM_EXPERT)
@@ -121,9 +120,6 @@ def load_sharded_experts_onto_device(
                 _placements = None
                 param = DTensor.from_local(
                     param, device_mesh=device_mesh, 
-                    placements=[Replicate(), _Partial()]
-                ).redistribute(
-                    device_mesh=device_mesh,
                     placements=[Replicate(), Shard(0)]
                 )
 
@@ -262,9 +258,6 @@ def shard_moe(
                 index["weight_map"], prefix, module_name, router_name, expert_name
             )
 
-            # _args = copy(mp_dmoe_args)
-            # _args.bias = has_bias
-
             # - will replace the MoE module with the megablocks sharded dMoE
             # - very hard to do patching, settle for module swap
             #   for now
@@ -275,9 +268,11 @@ def shard_moe(
                     hidden_act=model.config.hidden_act,
                     intermediate_size=model.config.intermediate_size,
                     num_experts=num_experts_per_device,
+                    all_to_all=True,
                     has_bias=has_bias,
                     dtype=model.dtype,
                     device=device,
+                    expert_parallel_group=device_mesh[key_ep].get_group(0)
                 )  # 
 
             load_sharded_experts_onto_device(
@@ -285,8 +280,6 @@ def shard_moe(
                 loc,
                 checkpoint_metadata,
                 device_mesh,
-                # placements,
-                # expert_name,
                 mixed_precision,
             )
             parent = model.get_submodule(prefix)

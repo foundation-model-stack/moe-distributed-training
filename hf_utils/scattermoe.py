@@ -54,6 +54,8 @@ class ScatteredExperts(torch.nn.Module):
             grouped_out=self.grouped_out,
         )
 
+from .megablocks_dist import all_to_all_gather_inputs, _scatter_with_routing_weights
+
 # slightly rewritten from KHD
 class ScatterMoE(torch.nn.Module):
 
@@ -68,6 +70,7 @@ class ScatterMoE(torch.nn.Module):
         all_to_all: bool = False,
         dtype: torch.dtype = torch.bfloat16,
         device: str = torch.device('cpu'),
+        expert_parallel_group = None,
         # **kwargs,
     ):
         assert has_bias == False, "dunno how to handle bias"
@@ -81,6 +84,10 @@ class ScatterMoE(torch.nn.Module):
         self.top_k = top_k
         self.all_to_all = all_to_all
 
+        # NOTE: we should then use this to distribute inside
+        # and not do the distribution outside
+        self.expert_parallel_group = expert_parallel_group
+
         self.router = torch.nn.Linear(
             in_features=hidden_size,
             out_features=num_experts,
@@ -88,7 +95,7 @@ class ScatterMoE(torch.nn.Module):
             dtype=dtype,
             device=device,
         )
-        # self._kwargs = kwargs
+
         # - col are those whose 
         # - keep em empty
         # self.col_linears: Dict[str, ScatteredExperts] = torch.nn.ModuleDict()
@@ -107,14 +114,14 @@ class ScatterMoE(torch.nn.Module):
                 out_features=self.intermediate_size,
                 num_experts=self.num_experts,
                 fan_out=self.top_k if not self.all_to_all else 1,
-                grouped_out=True,
+                grouped_in=True,
         )
         self.w3 = ScatteredExperts(
             in_features=self.intermediate_size,
             out_features=self.hidden_size,
             num_experts=self.num_experts,
-            fan_out=self.top_k if not self.all_to_all else 1,
-            grouped_in=True,
+            fan_out=1,
+            grouped_out=True,
             # grouped_out=False if self.args.moe_expert_model_parallelism else True
         )
 
@@ -127,7 +134,6 @@ class ScatterMoE(torch.nn.Module):
         bias = self.router.bias
         if bias: bias = resolve_dtensor(bias)
         router_logits = F.linear(hidden_states, weight, bias)
-        # router_logits = self.router(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
@@ -136,17 +142,58 @@ class ScatterMoE(torch.nn.Module):
         routing_weights = routing_weights.to(hidden_states.dtype)
         return router_logits, routing_weights, selected_experts
 
-    def _maybe_gather(self, selected_experts):
+    def _maybe_gather(self, hidden_states, selected_experts):
         # can replace with megablocks version of _indices_and_bins
         # this is if there is no 
+        sorted_expert_idxs, sorted_scattered_idxs = torch.sort(selected_experts.flatten())
         if not self.all_to_all:
-            sorted_expert_idxs, sorted_scattered_idxs = torch.sort(selected_experts.flatten())
-            return sorted_expert_idxs, sorted_scattered_idxs
-        
-        return NotImplementedError
+            # hidden states pass through
+            return hidden_states, sorted_expert_idxs, sorted_scattered_idxs
 
-    def _maybe_scatter(self):
-        pass
+        # needed for scattering later (if required)
+        local_gather_products = (
+            sorted_expert_idxs,
+            sorted_scattered_idxs
+        )
+
+        # outputs will be parallel_x, parallel_bin_ids, parallel_ind
+        # and followed by 
+        # send_counts, recv_counts, bins (local)
+        outputs = all_to_all_gather_inputs(
+            hidden_states, selected_experts, 
+            sorted_expert_idxs, sorted_scattered_idxs,
+            self.expert_parallel_group, 
+            self.top_k, 
+            self.num_experts, 
+        )
+
+        return outputs + local_gather_products
+
+    def _maybe_scatter(
+        self, hidden_states, 
+        expert_weights, original_shape, local_gather_products
+    ):
+
+        if not self.all_to_all:
+            return hidden_states.view(original_shape)
+
+        (
+            send_counts, recv_counts,
+            bins,
+            sorted_expert_idxs,
+            sorted_scattered_idxs
+        ) = local_gather_products
+
+        hidden_states = _scatter_with_routing_weights(
+            hidden_states,
+            expert_weights.flatten(),
+            send_counts, recv_counts,
+            bins, original_shape, # local
+            sorted_expert_idxs, sorted_scattered_idxs,
+            self.expert_parallel_group, 
+            self.top_k
+        )
+        return hidden_states
 
     def forward(self, hidden_states):
 
@@ -154,20 +201,36 @@ class ScatterMoE(torch.nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
         # _, batch_index, batch_gates, expert_size, router_logits = self.router(layer_input)
-        router_logits, routing_weights, selected_experts = self._compute_routing_weights(hidden_states)
+        router_logits, routing_weights, selected_experts = self._compute_routing_weights(
+            hidden_states
+        )
 
-        sorted_expert_idxs, sorted_scattered_idxs = self._maybe_gather(selected_experts)
+        # maybe gather
+        # - local_gather_products may or may not be non-empty
+        (
+            hidden_states, 
+            sorted_expert_idxs, 
+            sorted_scattered_idxs,
+            *local_gather_products
+        ) = self._maybe_gather(
+            hidden_states, selected_experts
+        )
 
+        # padded indicies need to be computed for scattermoe
         with torch.no_grad():
-            padded_block_idxs, expert_offsets = padded_block_indices(sorted_expert_idxs, self.num_experts)
+            padded_block_idxs, expert_offsets = padded_block_indices(
+                sorted_expert_idxs, self.num_experts
+            )
         
+        # the up projection
         out = self.w1(
             hidden_states,
             sorted_expert_idxs, sorted_scattered_idxs,
             padded_block_idxs, expert_offsets
         )
         out = self.activation(out)
-        # NOTE: in the future we can check this as a condition
+
+        # - if defined, a seperate up projection
         if self.w3:
             out *= self.w3(
                 hidden_states,
@@ -175,29 +238,21 @@ class ScatterMoE(torch.nn.Module):
                 padded_block_idxs, expert_offsets
             ) 
 
+        # the down projection
         hidden_states = self.w2(
             out,
             sorted_expert_idxs, sorted_scattered_idxs,
             padded_block_idxs, expert_offsets,
-            gates=routing_weights # Have to disable this later
+            gates=(
+                None if self.all_to_all else
+                routing_weights 
+            )
         ) 
 
-        self._maybe_scatter() # placeholder, noop
+        # maybe scatter
+        hidden_states = self._maybe_scatter(
+            hidden_states, routing_weights, original_shape,
+            local_gather_products,
+        ) 
 
-        # col_outs = ()
-        # for tag, scattered in self.col_linears.items():
-        #     out = scattered(
-        #         hidden_states,
-        #         sorted_expert_idxs, sorted_scattered_idxs,
-        #         padded_block_idxs, expert_offsets
-        #     )
-        #     col_outs = col_outs + (tag, out)
-
-        # col_outs = self._activation(col_outs)
-
-        # router
-        # expert_weights = routing_weights.flatten()
-        # top_experts = selected_experts.flatten()
-
-        hidden_states = hidden_states.view(original_shape)
         return hidden_states, router_logits
