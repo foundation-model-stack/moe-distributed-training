@@ -2,26 +2,20 @@
 from transformers.activations import ACT2FN
 import torch
 import torch.nn.functional as F
-
-FILE_SAFETENSOR_INDEX = "model.safetensors.index.json"
-KEY_REPLICATE = "data_parallel"
-KEY_EXPERT_PARALLEL = "expert_parallel"
-DIM_EXPERT = 0
-
-try:
-    import scattermoe
-    from scattermoe.parallel_experts import parallel_linear
-except ImportError:
-    pass
+from torch.distributed._tensor import DTensor
 
 try:
     from khd.kernels.scattermoe.triton_implementation.ops import (
-        _ScatteredExperts, scattered_experts, padded_block_indices
+        scattered_experts, padded_block_indices
     )
 except ImportError:
     pass
  
 
+def resolve_dtensor(weight):
+    if isinstance(weight, DTensor):
+        return weight.to_local()
+    return weight
 
 class ScatteredExperts(torch.nn.Module):
     def __init__(
@@ -46,10 +40,10 @@ class ScatteredExperts(torch.nn.Module):
         self, x, bin_ids, indices, padded_block_idxs, 
         expert_offsets, gates=None,
     ):
+        weight = resolve_dtensor(self.weight)
         return scattered_experts(
             x,
-            self.weight.to_local(),
-            # 1 if self.args.moe_expert_model_parallelism else self.fan_out,
+            weight,
             self.fan_out,
             bin_ids, # sorted_expert_idxs,
             indices, # sorted_scattered_idxs,
@@ -127,13 +121,12 @@ class ScatterMoE(torch.nn.Module):
     # def add_expert(self, key, 
     # dolomite, MoE_Torch
     def _compute_routing_weights(self, hidden_states):
-        # batch_size, sequence_length, hidden_dim = hidden_states.shape
-        # if self.training and self.jitter_noise > 0:
-        #     hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
-        # hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (batch * sequence_length, n_experts)
-        router_logits = F.linear(hidden_states, self.router.weight.to_local(), bias=None)
+        weight = resolve_dtensor(self.router.weight)
+        bias = self.router.bias
+        if bias: bias = resolve_dtensor(bias)
+        router_logits = F.linear(hidden_states, weight, bias)
         # router_logits = self.router(hidden_states)
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
@@ -208,8 +201,3 @@ class ScatterMoE(torch.nn.Module):
 
         hidden_states = hidden_states.view(original_shape)
         return hidden_states, router_logits
-
-    # def _gather(self)
-
-    # def _init_parameters(self):
-    #     raise NotImplementedError

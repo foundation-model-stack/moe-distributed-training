@@ -39,60 +39,16 @@ KEY_EXPERT_PARALLEL = "expert_parallel"
 DIM_EXPERT = 0
 
 KEY_SCATTERMOE_ROUTER = 'router'
-
-# class ScatterMoe(torch.nn.Module):
-# 
-#     def __init__(
-#         self, 
-#         hidden_size: int,
-#         intermediate_size: int,
-#         num_experts: int,
-#         **kwargs,
-#     ):
-#         super().__init__()
-#         self.hidden_size = hidden_size
-#         self.intermediate_size = intermediate_size
-#         self.num_experts = num_experts
-#         self._kwargs = kwargs
-# 
-#     def _init_parameters(self):
-#         raise NotImplementedError
-
-# def extract_experts_module_list(
-#     expert_module: torch.nn.ModuleList, # the expert module
-#     ff_dim: int,
-#     rank: int,
-#     world_size: int,
-#     device_mesh: DeviceMesh,
-#     ep_degree: int = 1,
-# ):
-# 
-#     # gather up all the shard
-#     state_dict = defaultdict(list)
-#     _ep_mesh = device_mesh[KEY_EXPERT_PARALLEL]
-#     _num_processes = _ep_mesh.size()
-#     _lr = _ep_mesh.get_local_rank()
-#     for i in range(_lr * ep_degree, (_lr + 1) * ep_degree):
-#         for param_name, param in expert_module[i].named_parameters():
-#             # state_dict[param_name].append(
-#             #     param if param.shape[0] > param.shape[1] else param.T
-#             # )
-#             assert len(param.shape) == 2, "unsupported shape"
-#             if param.shape[0] != ff_dim:
-#                 param = param.T
-#             param.unsqueeze(0)
-# 
-#     state_dict = {k: torch.concat(ps) for k, ps in state_dict.items()}
-# 
      
 from .shard_moe_utils_legacy import (
-    get_resolved_checkpoint_location,
     get_checkpoint_meta_from_sharded_safetensor
 )
 from .scattermoe import ScatterMoE
 
 
 KEY_SCATTERMOE_ROUTER = 'router.weight'
+
+from megablocks_utils.shard_moe_utils import get_resolved_checkpoint_location
 
 # this function will load the sharded experts onto the device.
 # - this assumes that the "dmoe" module is the megablocks.layers.dmoe.dMoE distributed
