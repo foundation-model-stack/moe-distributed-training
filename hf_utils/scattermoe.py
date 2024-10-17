@@ -26,10 +26,15 @@ class ScatteredExperts(torch.nn.Module):
         fan_out: int,
         grouped_in: bool = False,
         grouped_out: bool = False,
+        dtype: torch.dtype = torch.bfloat16,
+        device: torch.device = torch.device('cpu'),
     ):
         super().__init__()
         self.weight = torch.nn.Parameter(
-            torch.empty(num_experts, in_features, out_features, dtype=torch.bfloat16),
+            torch.empty(
+                num_experts, in_features, out_features, 
+                dtype=dtype, device=device,
+            ),
             requires_grad=True,
         )
         self.fan_out = fan_out
@@ -103,26 +108,32 @@ class ScatterMoE(torch.nn.Module):
         # NOTE: in the future we handle this by passing into 
         # this class a spec on how many to create
         self.w1 = ScatteredExperts(
-                in_features=self.hidden_size,
-                out_features=self.intermediate_size,
-                num_experts=self.num_experts,
-                fan_out=self.top_k if not self.all_to_all else 1,
-                grouped_out=True,
+            in_features=self.hidden_size,
+            out_features=self.intermediate_size,
+            num_experts=self.num_experts,
+            fan_out=self.top_k if not self.all_to_all else 1,
+            grouped_out=True,
+            dtype=dtype,
+            device=device,
         )
         self.w2 = ScatteredExperts(
-                in_features=self.hidden_size,
-                out_features=self.intermediate_size,
-                num_experts=self.num_experts,
-                fan_out=self.top_k if not self.all_to_all else 1,
-                grouped_in=True,
-        )
-        self.w3 = ScatteredExperts(
             in_features=self.intermediate_size,
             out_features=self.hidden_size,
             num_experts=self.num_experts,
             fan_out=1,
+            grouped_in=True,
+            dtype=dtype,
+            device=device,
+        )
+        self.w3 = ScatteredExperts(
+            in_features=self.hidden_size,
+            out_features=self.intermediate_size,
+            num_experts=self.num_experts,
+            fan_out=self.top_k if not self.all_to_all else 1,
             grouped_out=True,
             # grouped_out=False if self.args.moe_expert_model_parallelism else True
+            dtype=dtype,
+            device=device,
         )
 
     # def add_expert(self, key, 

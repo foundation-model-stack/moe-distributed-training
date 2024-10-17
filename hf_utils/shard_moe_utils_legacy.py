@@ -129,7 +129,8 @@ def get_checkpoint_meta_from_sharded_safetensor(
         if m.group(1) == router_name:
             _map["router.weight"].append((k, stfile))
         elif m.group(1) in expert_name:
-            index = int(m.group(2))
+            index = m.group(2)
+            index = 0 if index is None else int(index)
             mod = None
             for mod in expert_map.get(m.group(1), expert_map.get(m.group(3))):
                 _insert(_map[f"{mod}.weight"], index, (k, stfile))
@@ -147,3 +148,48 @@ def get_checkpoint_meta_from_sharded_safetensor(
         )
 
     return _map
+
+from collections import OrderedDict
+
+def convert_state_dict(
+    prefix: str,
+    metadata: Dict,
+    state_dict: Dict,
+    num_experts: int,
+    intermediate_size: int,
+    hidden_size: int,
+):
+    target = OrderedDict()
+
+    for scatter_key, vs in metadata.items():
+        for state_key, _ in vs:
+            state_key = state_key.replace(prefix, "")
+            param = state_dict[state_key]
+            
+            if (
+                scatter_key.startswith('w1') or 
+                scatter_key.startswith('w2') or
+                scatter_key.startswith('w3')
+            ):
+                if len(param.shape) == 2:
+                    param = param.view(num_experts, -1, param.shape[-1])
+
+                if scatter_key.startswith('w1') or scatter_key.startswith('w3'):
+                    if param.shape[-2] == (2 * intermediate_size):
+                        # cut it 
+                        if scatter_key.startswith('w1'):
+                            param = param[..., :intermediate_size, :]
+                        else:
+                            param = param[..., intermediate_size:, :]
+
+                    # asumme these are linears
+                    # assert param.shape[-2] == intermediate_size, "wrong intermediate size"
+                    # assert param.shape[-1] == hidden_size, "wrong hidden size"
+
+                # have to transpose for weights since scattermoe accepts the differen
+                # order
+                param = param.permute(0, 2, 1)
+
+            target[scatter_key] = param
+
+    return target

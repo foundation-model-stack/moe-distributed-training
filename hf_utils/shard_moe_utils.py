@@ -20,6 +20,7 @@ from typing import Dict, List, Tuple, Type, Union
 import json
 import os
 import re
+from contextlib import nullcontext
 import warnings
 
 # Third Party
@@ -30,6 +31,8 @@ from torch.distributed._tensor.device_mesh import DeviceMesh, init_device_mesh
 from tqdm import tqdm
 from transformers.activations import ACT2FN
 import torch
+from transformers.modeling_utils import is_fsdp_enabled, is_local_dist_rank_0
+
 
 FILE_SAFETENSOR_INDEX = "model.safetensors.index.json"
 KEY_REPLICATE = "replicate"
@@ -41,6 +44,7 @@ KEY_SCATTERMOE_ROUTER = 'router'
 from .shard_moe_utils_legacy import (
     get_checkpoint_meta_from_sharded_safetensor
 )
+from .shard_moe_utils_legacy import convert_state_dict
 from .scattermoe import ScatterMoE
 
 
@@ -51,20 +55,31 @@ from megablocks_utils.shard_moe_utils import get_resolved_checkpoint_location
 # this function will load the sharded experts onto the device.
 # - this assumes that the "dmoe" module is the megablocks.layers.dmoe.dMoE distributed
 #   implementation of the mixture of experts.
-def load_sharded_experts_onto_device(
-    dmoe: torch.nn.Module,
+def load_experts_onto_device(
+    module: torch.nn.Module,
     directory: str,
     checkpoint_metadata: Dict[str, List[Tuple]],
-    device_mesh: DeviceMesh,
+    intermediate_size: int, 
+    device_mesh: DeviceMesh = None,
+    device_type: torch.device = torch.device('cpu'),
     mixed_precision: bool = False,
 ):
 
-    assert device_mesh.ndim <= 2, "expected 1D or 2D device mesh"
+    if device_mesh is not None:
 
-    ep_mesh = device_mesh[KEY_EXPERT_PARALLEL]
-    ep_process_index = ep_mesh.get_local_rank()
+        # initialize placement stuff for sharding
+        assert device_mesh.ndim <= 2, "expected 1D or 2D device mesh"
 
-    _rep_placements = [Replicate() for _ in range(device_mesh.ndim - 1)]
+        # - rep placements
+        _rep_placements = [Replicate() for _ in range(device_mesh.ndim - 1)]
+
+        # - compute shard indices
+        ep_mesh = device_mesh[KEY_EXPERT_PARALLEL]
+        ep_process_index = ep_mesh.get_local_rank()
+        N = module.num_experts
+        _shard_indices = list(range(ep_process_index*N, (ep_process_index+1)*N))
+    else:
+        _shard_indices = None
 
     # typically they all should be same file, but to play safe, load the checkpoint file onto
     # cpu first since we may not need all weights in that file.
@@ -87,7 +102,12 @@ def load_sharded_experts_onto_device(
             if KEY_SCATTERMOE_ROUTER in weight_name:
                 k, fi = vs[0] # only one item
                 param = files[fi].get_tensor(k)
-                _placements = _rep_placements + [Replicate()]
+
+                if device_mesh is not None:
+                    param = distribute_tensor(
+                        param, device_mesh, 
+                        _rep_placements + [Replicate()]
+                    )
 
             elif len(vs) == 1:
                 k, fi = vs[0] # only one item
@@ -95,44 +115,73 @@ def load_sharded_experts_onto_device(
                 param = files[fi].get_tensor(k)
                 # NOTE: check for num_experts
                 assert len(param.shape) == 3, "wrong shape for non-sharded expert"
-                _placements = _rep_placements + [Shard(0)]
+
+                # if k.endswith('weight'):
+                #     # have to transpose for weights since scattermoe accepts the differen
+                #     # order
+                #     param = param.permute(0, 2, 1)
+
+                if device_mesh is not None:
+                    param = distribute_tensor(
+                        param, device_mesh, 
+                        _rep_placements + [Shard(0)]
+                    )
             else:
                 # handle sharding if the checkpoint shards experts
                 # - 
                 data = []
-                N = dmoe.num_experts
-                for k, fi in [
-                    vs[i] for i in range(
-                        ep_process_index*N,
-                        (ep_process_index+1)*N
-                    )
-                ]:
+                if _shard_indices is not None:
+                    vs = [vs[i] for i in _shard_indices]
+
+                for k, fi in vs:
                     T = files[fi].get_tensor(k)
                     assert len(T.shape) == 2, "wrong shape"
-                    if k.endswith('weight'):
-                        T = T.T # then its from a linear
+                    # if k.endswith('weight'):
+                    #     T = T.T # then its from a linear
 
                     T = T.unsqueeze(0)
                     data.append(T)
 
                 param = torch.concat(data, dim=DIM_EXPERT)
-                _placements = None
                 # NOTE: somehow this takes alot of memory, 
                 # - so if not rep skip for now
                 # - however, this means that there will be a mixture of 
                 #   dtensors and regular tensors in the grad norm calc
-                if device_mesh.ndim == 1:
-                    param = param.to(device_mesh.device_type)
-                else:
-                    param = DTensor.from_local(
-                        param, device_mesh=device_mesh, 
-                        placements= _rep_placements + [Shard(0)]
-                    )
+                if device_mesh is not None:
+                    if device_mesh.ndim == 1:
+                        param = param.to(device_mesh.device_type)
+                    else:
+                        param = DTensor.from_local(
+                            param, device_mesh=device_mesh, 
+                            placements= _rep_placements + [Shard(0)]
+                        )
+
+            # in all other cases, then we need to initialize
+            if device_mesh is None:
+                param = param.to(device_type)
 
             # get the module we want to shard
             name = weight_name.split(".")
             path, name = ".".join(name[:-1]), name[-1]
-            mod = dmoe.get_submodule(path)
+            mod = module.get_submodule(path)
+
+            if (
+                path.endswith('w1') or 
+                path.endswith('w2') or
+                path.endswith('w3')
+            ):
+
+                if path.endswith('w1') or path.endswith('w3'):
+                    if param.shape[-2] == (2 * intermediate_size):
+                        # cut it 
+                        if path.endswith('w1'):
+                            param = param[..., :intermediate_size, :]
+                        else:
+                            param = param[..., intermediate_size:, :]
+
+                # have to transpose for weights since scattermoe accepts the differen
+                # order
+                param = param.permute(0, 2, 1)
 
             # if mixed_precision and KEY_DMOE_ROUTER not in weight_name:
             if mixed_precision:
@@ -150,11 +199,7 @@ def load_sharded_experts_onto_device(
             param = param.to(mod_dtype)
 
             param = torch.nn.Parameter(
-                (
-                    param if _placements is None else
-                    distribute_tensor(param, device_mesh, _placements)
-                ),
-                requires_grad=requires_grad,
+                param, requires_grad=requires_grad,
             )
 
             # register the sharded parameter onto the megablocks.dmoe
@@ -163,6 +208,11 @@ def load_sharded_experts_onto_device(
     if mixed_precision:
         upcasted = ", ".join(sorted(upcasted))
         warnings.warn(f"Mixed precision turned on, upcasted MoE parameters: {upcasted}")
+
+SPEC = {
+    "MixtralForCausalLM": ('gate', 'experts'),
+    'GraniteMoeForCausalLM': ('router', 'input_linear|output_linear|input_linear')
+}
 
 def prepare_scattemoe(
     model: torch.nn.Module,
@@ -174,8 +224,8 @@ def prepare_scattemoe(
     key_rep: str = KEY_REPLICATE,
     key_ep: str = KEY_EXPERT_PARALLEL,
     device_type: str = 'cuda',
-    router_name: str = "gate",
-    expert_name: str = "experts", # can be regex with |
+    # router_name: str = "gate",
+    # expert_name: str = "experts", # can be regex with |
     mixed_precision: bool = False,
 ):
     assert world_size % ep_degree == 0, (
@@ -191,6 +241,16 @@ def prepare_scattemoe(
 
     # current rank of the device
     device = torch.device(f"{device_type}:{rank}")
+
+    # infer the router_name and expert_name
+    found = False
+    for archs, (router_name, expert_name) in SPEC.items():
+        archs = archs.split(',')
+        if any(x in archs for x in model.config.architectures):
+            found = True
+            break
+    assert found, "cannot configure scatter moe for this model"
+    expert_name = expert_name.split('|')
 
     rep_size = world_size // ep_degree
     if ep_degree == 1:
@@ -236,9 +296,11 @@ def prepare_scattemoe(
             # if there are biases
             # Assumption: assume that if one expert has bias,then the others
             # will have it to
-            has_bias = any(expert_name in k and k.endswith("bias") for k in fqdn_keys)
+            has_bias = any(expert_name[0] in k and k.endswith("bias") for k in fqdn_keys)
 
             found[parent] = (child, fqdn_keys, has_bias)
+
+    assert len(found) > 0, "cannot find scattermoe modules to replace"
 
     moe_module_names = set()
 
@@ -255,12 +317,18 @@ def prepare_scattemoe(
             found.items(), disable=(rank > 0), desc="Converting ScatterMoE layers"
         ):
             checkpoint_metadata = get_checkpoint_meta_from_sharded_safetensor(
-                index["weight_map"], prefix, module_name, router_name, expert_name
+                index["weight_map"], prefix, module_name, 
+                router_name, '|'.join(expert_name)
             )
+
+            load_from_state_dict = (
+                not is_fsdp_enabled() or is_local_dist_rank_0()
+            )
+            _context = nullcontext if load_from_state_dict is None else init_empty_weights
 
             # - conver to a scatter moe
             # - very hard to do patching, settle for module swap
-            with init_empty_weights():
+            with _context():
                 moe = ScatterMoE(
                     hidden_size=model.config.hidden_size,
                     hidden_act=model.config.hidden_act,
@@ -277,15 +345,28 @@ def prepare_scattemoe(
                     )
                 )  # 
 
-            if device_mesh is not None:
-                load_sharded_experts_onto_device(
+            parent = model.get_submodule(prefix)
+            if load_from_state_dict is None:
+                moe.load_state_dict(
+                    convert_state_dict(
+                        prefix + '.' + module_name + '.',
+                        checkpoint_metadata,
+                        getattr(parent, module_name).state_dict(),
+                        model.config.num_local_experts,
+                        model.config.intermediate_size,
+                        model.config.hidden_size,
+                    )
+                )
+            else:
+                load_experts_onto_device(
                     moe,
                     loc,
                     checkpoint_metadata,
+                    model.config.intermediate_size,
                     device_mesh,
+                    device,
                     mixed_precision,
                 )
-            parent = model.get_submodule(prefix)
             setattr(parent, module_name, moe)
 
             # - keep track of the name for returning
@@ -297,4 +378,3 @@ def prepare_scattemoe(
             "Currently only support non-GGUF safetensor checkpoints. "
         ) from e
 
-    return 
