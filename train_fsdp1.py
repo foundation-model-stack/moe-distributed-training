@@ -4,8 +4,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 from transformers import TrainingArguments
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import torch
-# from megablocks_utils.shard_moe_utils import shard_moe, get_moe_kwargs
-from hf_utils.shard_moe_utils import shard_moe
+from hf_utils.shard_moe_utils import prepare_scattemoe
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 from megablocks_utils.config_utils import update_mlp_registry
 
@@ -13,13 +12,12 @@ from megablocks_utils.config_utils import update_mlp_registry
 # - this uses HF Trainer's integration of FSDP1
 MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-update_mlp_registry()
-
 def main(
     max_seq_length=4096,
     load_model_dtype='bfloat16', # FSDP shared params will take 
     attn_implementation='sdpa',
-    use_megablocks_sharding: bool = False,
+    use_scattermoe: bool = False,
+    ep_degree: int = None,
     truncate_model_for_debug: bool = False,
 ):
 
@@ -75,21 +73,16 @@ def main(
         data_collator=data_collator,
     )
 
-    if use_megablocks_sharding:
+    if use_scattermoe:
 
-        dp_mesh = shard_moe(
+        prepare_scattemoe(
             model, 
             MixtralSparseMoeBlock, 
             checkpoint_name_or_path=MODEL_NAME,
             rank=torch.distributed.get_rank(),
             world_size=torch.distributed.get_world_size(),
-            ep_degree=torch.distributed.get_world_size(),
-            # moe_kwargs=get_moe_kwargs(
-            #     model.config, 
-            #     has_bias=False,
-            #     fp16=training_args.fp16,
-            #     bf16=training_args.bf16,
-            # ),
+            # ep_degree=torch.distributed.get_world_size(),
+            ep_degree=ep_degree,
         )
 
         trainer.accelerator.state.fsdp_plugin.ignored_modules = [
