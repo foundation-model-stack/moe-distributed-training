@@ -1,0 +1,1 @@
+from .scattermoe_utils import prepare_scattemoe

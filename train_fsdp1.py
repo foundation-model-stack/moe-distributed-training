@@ -4,21 +4,21 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
 from transformers import TrainingArguments
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 import torch
-from megablocks_utils.shard_moe_utils import shard_moe, get_moe_kwargs
+from fms_accel import prepare_scattemoe
 from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
-from megablocks_utils.config_utils import update_mlp_registry
 
 # Demo for running databricks megablocks on mixtral using accelerate + FSDP1
 # - this uses HF Trainer's integration of FSDP1
 MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-update_mlp_registry()
-
 def main(
+    model_name_or_path=MODEL_NAME,
+    moe_module_name="MixtralSparseMoeBlock",
     max_seq_length=4096,
     load_model_dtype='bfloat16', # FSDP shared params will take 
     attn_implementation='sdpa',
-    use_megablocks_sharding: bool = False,
+    use_scattermoe: bool = False,
+    ep_degree: int = None,
     truncate_model_for_debug: bool = False,
 ):
 
@@ -28,7 +28,7 @@ def main(
     training_args, _ = parser.parse_args_into_dataclasses(return_remaining_strings=True)
 
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        model_name_or_path,
         torch_dtype=getattr(torch, load_model_dtype), ## UPDATED
         attn_implementation=attn_implementation, ## UPDATED
     )
@@ -39,7 +39,7 @@ def main(
 
     # we set the max sequence length here
     tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME, model_max_length=max_seq_length,
+        model_name_or_path, model_max_length=max_seq_length,
     )
 
     if tokenizer.pad_token is None:
@@ -74,21 +74,15 @@ def main(
         data_collator=data_collator,
     )
 
-    if use_megablocks_sharding:
+    if use_scattermoe:
 
-        dp_mesh = shard_moe(
+        prepare_scattemoe(
             model, 
-            MixtralSparseMoeBlock, 
-            checkpoint_name_or_path=MODEL_NAME,
+            moe_module_name, 
+            checkpoint_name_or_path=model_name_or_path,
             rank=torch.distributed.get_rank(),
             world_size=torch.distributed.get_world_size(),
-            ep_size=torch.distributed.get_world_size(),
-            moe_kwargs=get_moe_kwargs(
-                model.config, 
-                has_bias=False,
-                fp16=training_args.fp16,
-                bf16=training_args.bf16,
-            ),
+            ep_degree=ep_degree,
         )
 
         trainer.accelerator.state.fsdp_plugin.ignored_modules = [
