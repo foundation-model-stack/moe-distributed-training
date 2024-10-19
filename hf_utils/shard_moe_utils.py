@@ -253,7 +253,7 @@ def prepare_scattemoe(
     expert_name = expert_name.split('|')
 
     rep_size = world_size // ep_degree
-    if ep_degree == 1:
+    if ep_degree == 1 and rep_size == 1:
         # in this case no need for sharding
         device_mesh = None
     elif rep_size == 1:
@@ -321,8 +321,13 @@ def prepare_scattemoe(
                 router_name, '|'.join(expert_name)
             )
 
+            # - currently we can only load from the state dict in the 
+            #   no distribution case. This is because all the palcements
+            #   happens inside the load_expert_onto_device call
             load_from_state_dict = (
-                not is_fsdp_enabled() or is_local_dist_rank_0()
+                world_size == 1 and (
+                    not is_fsdp_enabled() or is_local_dist_rank_0()
+                )
             )
             _context = nullcontext if load_from_state_dict is None else init_empty_weights
 
@@ -336,6 +341,7 @@ def prepare_scattemoe(
                     num_experts=num_experts_per_device,
                     all_to_all=(ep_degree > 1),
                     has_bias=has_bias,
+                    top_k=model.config.num_experts_per_tok,
                     dtype=model.dtype,
                     device=device,
                     expert_parallel_group=(
