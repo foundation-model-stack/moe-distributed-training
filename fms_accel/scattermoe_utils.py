@@ -68,11 +68,11 @@ def load_experts_onto_device(
     module: torch.nn.Module,
     state_dict: OrderedDict,
     device_mesh: DeviceMesh,
-    is_sharded_params: bool = False,
+    num_experts_per_device: int, 
 ):
 
     # required replication placements
-    reps = [Replicate() for _ in range(device_mesh[KEY_EXPERT_PARALLEL].ndim -1)]
+    reps = [Replicate() for _ in range(device_mesh.ndim -1)]
 
     for weight_name, param in state_dict.items():
 
@@ -81,7 +81,7 @@ def load_experts_onto_device(
             param = distribute_tensor(
                 param, device_mesh, reps + [Replicate()]
             )
-        elif not is_sharded_params:
+        elif param.shape[0] > num_experts_per_device:
             param = distribute_tensor(
                 param, device_mesh, 
                 reps + [Shard(0)]
@@ -143,7 +143,7 @@ def prepare_scattemoe(
     # infer the router_name and expert_name
     found = False
     for archs, (
-        router_name, expert_name, expert_mlp_spec
+        router_name, expert_name, expert_mlp_spec, sharded_expert_ckpt
     ) in SCATTERMOE_CONVERSION_SPEC.items():
         archs = archs.split(',')
         if any(x in archs for x in model.config.architectures):
@@ -238,10 +238,13 @@ def prepare_scattemoe(
             parent = model.get_submodule(prefix)
 
             # - handle state dict loading
+            # - NOTE: convert_state_dict does not have logic to concat sharded
+            #   experts so cannot handle this case
             if (
                 ep_degree == 1 and (
                     not is_fsdp_enabled() or is_local_dist_rank_0()
-                )
+                ) and
+                not sharded_expert_ckpt # cannot be a sharded checkpoint
             ):
                 # - if there is no sharding, and model is not loaded on the
                 #   meta device, we can simply convert the state dict
@@ -259,7 +262,7 @@ def prepare_scattemoe(
                 sd = get_state_dict_from_checkpoint_metadata(
                     loc,
                     checkpoint_metadata,
-                    model.config.num_local_experts,
+                    num_experts_per_device,
                     model.config.intermediate_size,
                     expert_shards,
                     dtype
@@ -286,6 +289,7 @@ def prepare_scattemoe(
                     top_k=model.config.num_experts_per_tok,
                     dtype=model.dtype,
                     device=device,
+                    device_mesh=device_mesh,
                     key_ep=key_ep,
                 )  # 
 
@@ -301,7 +305,7 @@ def prepare_scattemoe(
                     moe,
                     sd, 
                     device_mesh,
-                    is_sharded_params=(expert_shards is not None)
+                    num_experts_per_device
                 )
 
             # module swap

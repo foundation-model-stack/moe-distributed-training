@@ -95,7 +95,7 @@ class ScatterMoE(torch.nn.Module):
         self.activation = ACT2FN[hidden_act]
         self.top_k = top_k
         self.all_to_all = (
-            device_mesh[key_ep].ndim > 1 
+            device_mesh[key_ep].size() > 1 
             if device_mesh is not None
             else False
         )
