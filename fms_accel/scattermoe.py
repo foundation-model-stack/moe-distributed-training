@@ -13,6 +13,7 @@ except ImportError:
     pass
  
 from .scattermoe_constants import SCATTERMOE_HAS_GATE_WEIGHT_SPEC
+from .scattermoe_utils import all_to_all_gather_inputs, scatter_with_routing_weights
 
 def resolve_dtensor(weight):
     if isinstance(weight, DTensor):
@@ -60,8 +61,6 @@ class ScatteredExperts(torch.nn.Module):
             grouped_in=self.grouped_in,
             grouped_out=self.grouped_out,
         )
-
-from .megablocks_dist import all_to_all_gather_inputs, _scatter_with_routing_weights
 
 # similar to of MoE_Triton from https://github.com/mayank31398/kernel-hyperdrive
 # and ParameterizedScatteredExperts from https://github.com/IBM/dolomite-engine/blob/main/dolomite_engine/hf_models/models/moe_dolomite/moe/scatter.py
@@ -196,10 +195,12 @@ class ScatterMoE(torch.nn.Module):
 
     def _maybe_scatter(
         self, hidden_states, 
-        expert_weights, original_shape, local_gather_products
+        routing_weights, original_shape, local_gather_products
     ):
 
         if not self.all_to_all:
+            # in this case scattering is already handled by 
+            # scattermoe when computing w2
             return hidden_states.view(original_shape)
 
         (
@@ -209,9 +210,9 @@ class ScatterMoE(torch.nn.Module):
             sorted_scattered_idxs
         ) = local_gather_products
 
-        hidden_states = _scatter_with_routing_weights(
+        hidden_states = scatter_with_routing_weights(
             hidden_states,
-            expert_weights.flatten(),
+            routing_weights.flatten(),
             send_counts, recv_counts,
             bins, original_shape, # local
             sorted_expert_idxs, sorted_scattered_idxs,

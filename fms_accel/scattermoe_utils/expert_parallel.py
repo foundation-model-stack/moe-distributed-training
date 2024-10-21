@@ -6,7 +6,6 @@ from megablocks.layers.all_to_all import all_to_all
 def no_indices_just_bins(top_expert, num_experts):
     # Sort the expert ids to produce the scatter/gather
     # indices for the permutation.
-    #
 
     # Histogram the expert ids to identify the number of
     # tokens routed to each expert.
@@ -147,7 +146,7 @@ def all_to_all_gather_inputs(
         bins # local
     )
 
-def _scatter_with_routing_weights(
+def scatter_with_routing_weights(
     x,
     expert_weights,
     send_counts, recv_counts,
