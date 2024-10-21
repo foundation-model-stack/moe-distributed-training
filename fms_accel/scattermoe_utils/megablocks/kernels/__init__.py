@@ -14,4 +14,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .autograd import all_to_all, gather, scatter
+from .gather_scatter import gather, scatter, scatter_wgrad

@@ -15,20 +15,21 @@
 
 import torch
 import numpy as np
+from functools import partial
 
 try:
     # if megablocks is installed, import the kernels, distributed 
     # and kernel functions
 
+    raise ImportError("Go to the replacements for debugging")
+
     # - mixture of triton and cuda kernels
     import megablocks.ops as ops
-
-    raise ImportError("Go to the replacements for debugging")
 
     # - distributed autograd
     from megablocks.layers.all_to_all import all_to_all
     from megablocks.ops import (
-        histogram, inclusive_cumsum, sort, replicate
+        histogram, inclusive_cumsum, sort, replicate,
     )
     # this is a radix sort for integral indices 0 .. num_bins-1
     def sort(indices: torch.Tensor, num_bins: int):
@@ -48,7 +49,7 @@ try:
 except ImportError:
 
     # - distributed autograd
-    from .megablocks import all_to_all
+    from .megablocks import all_to_all, gather, scatter 
 
     # take the histogram of integral indices from 0 .. num_bins-1
     def histogram(
@@ -122,7 +123,7 @@ def all_to_all_gather_inputs(
     #
     # This view updates the shape of the tensor from [sl, bs, hs] to
     # [sl * bs, hs] prior to the permutation.
-    x = ops.gather(x, indices, bin_ids, bins, top_k)
+    x = gather(x, indices, bin_ids, bins, top_k)
 
     # Compute the number of tokens that will be received from each
     # device and permute the input data across the devices.
@@ -205,7 +206,7 @@ def scatter_with_routing_weights(
     )
 
     # Un-permute locally to setup for the next series of operations.
-    x = ops.scatter(
+    x = scatter(
         x, indices, bin_ids, expert_weights, 
         bins, top_k
     )
