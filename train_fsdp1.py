@@ -76,6 +76,18 @@ def main(
 
     if use_scattermoe:
 
+        # for newer torch that enables foreach for Dtensors we need to remove it
+        from torch.optim.optimizer import _foreach_supported_types
+        from torch.distributed._tensor import DTensor
+
+        i = 0
+        while i < len(_foreach_supported_types):
+            x = _foreach_supported_types[i]
+            if x.__name__ == 'DTensor':
+                _foreach_supported_types.pop(i)
+            else:
+                i += 1 
+
         prepare_scattemoe(
             model, 
             moe_module_name, 
