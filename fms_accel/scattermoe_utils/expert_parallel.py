@@ -15,13 +15,10 @@
 
 import torch
 import numpy as np
-from functools import partial
 
 try:
     # if megablocks is installed, import the kernels, distributed 
     # and kernel functions
-
-    raise ImportError("Go to the replacements for debugging")
 
     # - mixture of triton and cuda kernels
     import megablocks.ops as ops
@@ -29,12 +26,14 @@ try:
     # - distributed autograd
     from megablocks.layers.all_to_all import all_to_all
     from megablocks.ops import (
-        histogram, inclusive_cumsum, sort, replicate,
+        histogram, inclusive_cumsum, sort, replicate, gather, scatter
     )
     # this is a radix sort for integral indices 0 .. num_bins-1
     def sort(indices: torch.Tensor, num_bins: int):
         bits = max(int(np.ceil(np.log2(num_bins))), 1)
-        return ops.sort(indices, bits)
+        # TODO: figure out why we need this upcast
+        bins, inds = ops.sort(indices, bits)
+        return bins, inds.to(torch.int64)
 
     # replicate indices with bins
     def replicate(indices: torch.Tensor, bins: torch.Tensor):
