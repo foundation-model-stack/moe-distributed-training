@@ -27,6 +27,7 @@ from tqdm import tqdm
 import torch
 from transformers.modeling_utils import is_fsdp_enabled, is_local_dist_rank_0
 from transformers import PretrainedConfig
+from peft import LoraConfig
 
 from .scattermoe import ScatterMoE
 from .scattermoe_constants import (
@@ -125,6 +126,7 @@ def prepare_scattemoe(
     key_ep: str = KEY_EXPERT_PARALLEL,
     device_type: str = 'cuda',
     mixed_precision: bool = False,
+    lora_config: LoraConfig = None,
 ):
     assert world_size % ep_degree == 0, (
         f"world size ({world_size}) "
@@ -239,7 +241,7 @@ def prepare_scattemoe(
 
             # - handle state dict loading
             # - NOTE: convert_state_dict does not have logic to concat sharded
-            #   experts so cannot handle this case
+            #   experts so cannot handle the case where sharded_expert_ckpt=True
             if (
                 ep_degree == 1 and (
                     not is_fsdp_enabled() or is_local_dist_rank_0()
@@ -291,11 +293,45 @@ def prepare_scattemoe(
                     device=device,
                     device_mesh=device_mesh,
                     key_ep=key_ep,
+                    lora_config=lora_config,
                 )  # 
+
+            # the state dict logic below will not have lora adapters
+            # - so we need to initialize them
+            # - initialize them 
+            if lora_config is not None:
+                # if (
+                #     ep_degree == 1 and (
+                #         not is_fsdp_enabled() or is_local_dist_rank_0()
+                #     ) 
+                # ):
+                #     # NOTE: maybe change it so that we can 
+                #     # init the state dict directly?
+                #     moe.init_experts_lora()
+
+                # update the state_dict
+                for name, param in moe.named_parameters():
+                    # NOTE: is his reliable?
+                    if 'lora_' in name:
+                        if device_mesh is not None:
+                            # this means it has been loaded with empty context above
+                            # - so materialize the tensor
+                            param = torch.empty(*param.size(), dtype=dtype, requires_grad=True)
+
+                        sd[name] = param # set the param in state dict
+
+                        # initialize the loras here
+                        if 'lora_A' in name:
+                            torch.nn.init.zeros_(sd[name])
+                        elif 'lora_B' in name:
+                            torch.nn.init.normal_(sd[name])
 
             if device_mesh is None:
                 # - if not on meta, just load the state dict
                 # - and then put on the device
+                # # - if there is lora, there will be missing keys so need
+                # #   to set strict=False.
+                # moe.load_state_dict(sd, strict=lora_config is None)
                 moe.load_state_dict(sd)
                 moe = moe.to(device)
             else:
@@ -307,7 +343,6 @@ def prepare_scattemoe(
                     device_mesh,
                     num_experts_per_device
                 )
-
             # module swap
             setattr(parent, module_name, moe)
 

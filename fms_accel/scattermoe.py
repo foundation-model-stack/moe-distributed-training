@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch.distributed._tensor import DTensor
 from torch.distributed._tensor.device_mesh import DeviceMesh
+from peft import LoraConfig
+from peft.utils import INCLUDE_LINEAR_LAYERS_SHORTHAND
 
 try:
     from khd.kernels.scattermoe.triton_implementation.ops import (
@@ -31,6 +33,7 @@ class ScatteredExperts(torch.nn.Module):
         grouped_out: bool = False,
         dtype: torch.dtype = torch.bfloat16,
         device: torch.device = torch.device('cpu'),
+        lora_config: LoraConfig = None,
     ):
         super().__init__()
         self.weight = torch.nn.Parameter(
@@ -40,6 +43,32 @@ class ScatteredExperts(torch.nn.Module):
             ),
             requires_grad=True,
         )
+        self.lora_A, self.lora_B = None, None
+        self.lora_r = 0
+        if lora_config is not None:
+            # no gradient for base layer
+            self.weight.requires_grad = False
+
+            # NOTE : - for now adapter takes same dtype as base
+            self.lora_A = torch.nn.Parameter(
+                torch.empty(
+                    num_experts, in_features, lora_config.r,
+                    dtype=dtype, device=device,
+                ),
+                requires_grad=True,
+            )
+            self.lora_B = torch.nn.Parameter(
+                torch.empty(
+                    num_experts, lora_config.r, out_features,
+                    dtype=dtype, device=device,
+                ),
+                requires_grad=True,
+            )
+            self.lora_r = lora_config.r
+            
+            # NOTE: call init_lora to initialize the adapters
+            # - not called during initialization
+
         self.fan_out = fan_out
         self.grouped_in = grouped_in
         self.grouped_out = grouped_out
@@ -49,6 +78,11 @@ class ScatteredExperts(torch.nn.Module):
         expert_offsets, gates=None,
     ):
         weight = resolve_dtensor(self.weight)
+        lora_A, lora_B = None, None
+        if self.lora_r > 0:
+            lora_A, lora_B = (
+                resolve_dtensor(self.lora_A), resolve_dtensor(self.lora_B)
+            )
         return scattered_experts(
             x,
             weight,
@@ -60,6 +94,9 @@ class ScatteredExperts(torch.nn.Module):
             gates=gates, # we dont have router weights
             grouped_in=self.grouped_in,
             grouped_out=self.grouped_out,
+            expert_lora_A=lora_A,
+            expert_lora_B=lora_B,
+            lora_alp=self.lora_r,
         )
 
 # similar to of MoE_Triton from https://github.com/mayank31398/kernel-hyperdrive
@@ -80,12 +117,25 @@ class ScatterMoE(torch.nn.Module):
         device: str = torch.device('cpu'),
         device_mesh: DeviceMesh = None,
         key_ep: str = None,
+        lora_config: LoraConfig = None,
     ):
         assert has_bias == False, \
             "ScatterMoE currently unable to handle bias in both gates and experts."
 
-        super().__init__()
+        if lora_config is not None:
+            # since this is self implemented, we really only support basic lora funcs
+            assert lora_config.bias == 'none', \
+                "ScatterMoE currently unable to handle bias in the lora adapters"
+            assert (
+                lora_config.target_modules == INCLUDE_LINEAR_LAYERS_SHORTHAND or 
+                INCLUDE_LINEAR_LAYERS_SHORTHAND in lora_config.target_modules
+            ), \
+                "ScatterMoe currently only handles lora adapters on all linears."
 
+            assert lora_config.init_lora_weights in {True, 'gaussian'}, \
+                "ScatterMoe currently only handles gaussian initialization."
+
+        super().__init__()
 
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -128,6 +178,7 @@ class ScatterMoE(torch.nn.Module):
             grouped_out=True,
             dtype=dtype,
             device=device,
+            lora_config=lora_config,
         )
         self.w2 = ScatteredExperts(
             in_features=self.intermediate_size,
@@ -137,6 +188,7 @@ class ScatterMoE(torch.nn.Module):
             grouped_in=True,
             dtype=dtype,
             device=device,
+            lora_config=lora_config,
         )
         if mlp_arch == SCATTERMOE_HAS_GATE_WEIGHT_SPEC:
             self.w3 = ScatteredExperts(
@@ -147,6 +199,7 @@ class ScatterMoE(torch.nn.Module):
                 grouped_out=True,
                 dtype=dtype,
                 device=device,
+                lora_config=lora_config,
             )
 
     # def add_expert(self, key, 
