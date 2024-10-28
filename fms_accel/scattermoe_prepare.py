@@ -17,6 +17,7 @@ from collections import OrderedDict
 from typing import Type, Union
 import json
 import os
+import math
 from contextlib import nullcontext
 
 # Third Party
@@ -72,6 +73,13 @@ def load_experts_onto_device(
     num_experts_per_device: int, 
 ):
 
+    # hook for scaling the gradient
+    scaling = math.prod(device_mesh.shape)
+    def _hook(grad):
+        if grad is not None:
+            grad.div_(scaling)
+        return grad
+
     # required replication placements
     reps = [Replicate() for _ in range(device_mesh.ndim -1)]
 
@@ -92,14 +100,13 @@ def load_experts_onto_device(
             # - so if not rep skip for now
             # - however, this means that there will be a mixture of 
             #   dtensors and regular tensors in the grad norm calc
-            if device_mesh is not None:
-                if device_mesh.ndim == 1:
-                    param = param.to(device_mesh.device_type)
-                else:
-                    param = DTensor.from_local(
-                        param, device_mesh=device_mesh, 
-                        placements= reps + [Shard(0)]
-                    )
+            if device_mesh.ndim == 1:
+                param = param.to(device_mesh.device_type)
+            else:
+                param = DTensor.from_local(
+                    param, device_mesh=device_mesh, 
+                    placements= reps + [Shard(0)]
+                )
 
         # get the module we want to shard
         name = weight_name.split(".")
@@ -110,6 +117,9 @@ def load_experts_onto_device(
         param = torch.nn.Parameter(
             param, requires_grad=requires_grad,
         )
+
+        # install gradient scaling hook
+        param.register_hook(_hook)
 
         # register the sharded parameter onto the megablocks.dmoe
         mod.register_parameter(name, param)
