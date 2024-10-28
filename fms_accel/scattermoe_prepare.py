@@ -74,7 +74,9 @@ def load_experts_onto_device(
 ):
 
     # hook for scaling the gradient
-    scaling = math.prod(device_mesh.shape)
+    # scaling = math.prod(device_mesh.shape)
+    scaling = device_mesh[KEY_EXPERT_PARALLEL].size()
+    # print ("scaling", scaling)
     def _hook(grad):
         if grad is not None:
             grad.div_(scaling)
@@ -119,7 +121,8 @@ def load_experts_onto_device(
         )
 
         # install gradient scaling hook
-        param.register_hook(_hook)
+        if KEY_SCATTERMOE_ROUTER not in weight_name:
+            param.register_hook(_hook)
 
         # register the sharded parameter onto the megablocks.dmoe
         mod.register_parameter(name, param)

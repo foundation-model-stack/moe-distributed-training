@@ -5,8 +5,16 @@
 # need to debug the torch version issues first
 # torch==2.3.1
 
+# - flash-attn is very hard to build for torch 2.5
+# - also we found some nan issues with 2.5 SDPA
 torch < 2.5
-transformers 
+
+# freeze the transformers version first bcecause granite
+# has very strange loss problems
+transformers < 4.46
+
+flash-attn
+
 accelerate >= 0.29
 trl # for the dataloader
 tqdm
