@@ -1,9 +1,20 @@
+# optional
+# megablocks @ git+https://github.com/databricks/megablocks.git@bce5d7b2aaf5038bc93b36f76c2baf51c2939bd2
 
-megablocks @ git+https://github.com/databricks/megablocks.git@bce5d7b2aaf5038bc93b36f76c2baf51c2939bd2
 
+# need to debug the torch version issues first
+# torch==2.3.1
 
-torch == 2.3.1
-transformers 
+# - flash-attn is very hard to build for torch 2.5
+# - also we found some nan issues with 2.5 SDPA
+torch < 2.5
+
+# freeze the transformers version first bcecause granite
+# has very strange loss problems
+transformers < 4.46
+
+flash-attn
+
 accelerate >= 0.29
 trl # for the dataloader
 tqdm
